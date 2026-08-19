@@ -996,7 +996,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
         }
     }
 
-    let mut ordered_line_groups: Vec<(u32, f32, Vec<&TextItem>, bool)> = Vec::new();
+    let mut ordered_line_groups: Vec<(u32, f32, Vec<&TextItem>, bool, bool)> = Vec::new();
 
     // Sort each group by X position (direction-aware), except for lines whose
     // content stream intentionally backtracks to overlay ActualText fragments.
@@ -1008,7 +1008,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
         } else if !preserve_stream_order {
             group.sort_by(|a, b| a.x.total_cmp(&b.x));
         }
-        ordered_line_groups.push((page, y, group, preserve_stream_order));
+        ordered_line_groups.push((page, y, group, preserve_stream_order, rtl));
     }
 
     // Sort groups by page then Y descending (top of page first)
@@ -1016,12 +1016,21 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
 
     let mut merged = Vec::new();
 
-    for (_, _, group, preserve_stream_order) in &ordered_line_groups {
+    for (_, _, group, preserve_stream_order, rtl) in &ordered_line_groups {
         let mut i = 0;
         while i < group.len() {
             let first = group[i];
             let mut text = first.text.clone();
             let mut end_x = first.x + effective_merge_width(first);
+            // RTL-sorted groups (see the `group.sort_by` above) walk the line
+            // right-to-left: `group[i]` is the visually rightmost / logically
+            // first glyph, and each subsequent `next` sits further left. The
+            // run therefore grows leftward, not rightward, so it needs its
+            // own pair of edges: `run_right_edge` is fixed at the outer edge
+            // of `first` (never moves), and `left_edge` is the run's current
+            // leftmost boundary, updated as items merge in.
+            let run_right_edge = end_x;
+            let mut left_edge = first.x;
 
             // Tracked display text: run-local space floor overrides the
             // fixed thresholds for this run's junctions (see helper).
@@ -1034,10 +1043,34 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
             let mut j = i + 1;
             while j < group.len() {
                 let next = group[j];
+                // The adjacency gap between the run built so far and `next`.
+                // LTR (and stream-order-preserving) runs walk left-to-right,
+                // so the gap is measured from the run's rightmost edge
+                // (`end_x`) out to `next`'s left edge. RTL-sorted runs walk
+                // right-to-left, so the same measurement has to be mirrored:
+                // from the run's leftmost edge (`left_edge`) in to `next`'s
+                // *right* edge (`next.x + width`).
+                //
+                // Root cause of the "تعريفات" bug (individually-reversed,
+                // space-separated Arabic letters instead of merged words):
+                // the RTL sort branch above is correct, but this gap
+                // computation used to unconditionally apply the LTR formula
+                // (`next.x - end_x`) even for RTL-sorted items, where
+                // `next.x` sits to the *left* of the current run. That
+                // produced large spurious negative gaps at every RTL
+                // junction — e.g. -16.76pt measured against a -5.625pt
+                // reject threshold — even though the actual visual gap
+                // between the touching letters was ~0.01-0.02pt. Letters
+                // never merged, so RTL words came out as individually
+                // reversed, space-separated glyphs.
+                let gap = if *rtl {
+                    left_edge - (next.x + effective_merge_width(next))
+                } else {
+                    next.x - end_x
+                };
                 // A small-caps junction is mid-word: it both survives the
                 // font-size band below and must never take a space.
-                let small_caps_join =
-                    is_small_caps_continuation(&text, first, next, next.x - end_x);
+                let small_caps_join = is_small_caps_continuation(&text, first, next, gap);
                 // Must be similar font size, except for genuine small-caps
                 // runs, where the shrunken capitals are the same word as the
                 // full-size initial (see helper).
@@ -1059,7 +1092,6 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 {
                     break;
                 }
-                let gap = next.x - end_x;
                 let x_gap_max = if *preserve_stream_order && is_standalone_bullet_text(&text) {
                     first.font_size * 1.2
                 } else {
@@ -1101,20 +1133,35 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     text.push(' ');
                 }
                 text.push_str(&next.text);
-                let next_end = next.x + effective_merge_width(next);
-                end_x = if *preserve_stream_order {
-                    end_x.max(next_end)
+                if *rtl {
+                    // The run grows leftward: track the new leftmost edge.
+                    left_edge = left_edge.min(next.x);
                 } else {
-                    next_end
-                };
+                    let next_end = next.x + effective_merge_width(next);
+                    end_x = if *preserve_stream_order {
+                        end_x.max(next_end)
+                    } else {
+                        next_end
+                    };
+                }
                 j += 1;
             }
 
+            // For RTL runs, `first.x` is only the left edge of the visually
+            // rightmost (logically first) glyph, not the run's overall left
+            // boundary — that's `left_edge`, tracked above. The run's fixed
+            // right edge is `run_right_edge`, captured before the walk.
+            let (item_x, item_width) = if *rtl {
+                (left_edge, run_right_edge - left_edge)
+            } else {
+                (first.x, end_x - first.x)
+            };
+
             merged.push(TextItem {
                 text,
-                x: first.x,
+                x: item_x,
                 y: first.y,
-                width: end_x - first.x,
+                width: item_width,
                 height: first.height,
                 font: first.font.clone(),
                 font_size: first.font_size,
