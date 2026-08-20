@@ -309,10 +309,11 @@ pub(crate) fn extract_page_text_items(
         rotated: 0,
     };
 
-    // Marked content tracking: (ActualText, MCID) per nesting level
+    // Marked content tracking: (ActualText, MCID, tag name) per nesting level
     struct MarkedContentEntry {
         actual_text: Option<String>,
         mcid: Option<i64>,
+        tag: Option<String>,
     }
     let mut marked_content_stack: Vec<MarkedContentEntry> = Vec::new();
     let mut suppress_glyph_extraction = false;
@@ -325,6 +326,37 @@ pub(crate) fn extract_page_text_items(
     /// Get the innermost MCID from the marked content stack.
     fn current_mcid(stack: &[MarkedContentEntry]) -> Option<i64> {
         stack.iter().rev().find_map(|e| e.mcid)
+    }
+    /// Whether we're currently inside a `BMC /ReversedChars` (or nested
+    /// `BDC /ReversedChars`) span. That marked-content tag is a real PDF
+    /// convention (also handled by e.g. pdf.js) signaling that glyph codes
+    /// in the enclosed Tj/TJ operands are stored in visual (already
+    /// left-to-right) order rather than logical reading order, and must be
+    /// reversed to recover it. See `reverse_cid_pairs` below.
+    fn reversed_chars_active(stack: &[MarkedContentEntry]) -> bool {
+        stack.iter().any(|e| e.tag.as_deref() == Some("ReversedChars"))
+    }
+    /// Reverse the order of 2-byte CID codes within a raw PDF string
+    /// operand, without touching the bytes *within* each CID.
+    ///
+    /// Used only for text inside `BMC /ReversedChars` marked content. A
+    /// producer packing multiple CIDs into one Tj/TJ string operand under
+    /// that tag stores them in visual order; each individual CID's own
+    /// (possibly multi-character) ToUnicode mapping is decoded correctly
+    /// regardless — only the *order of separate CIDs relative to each
+    /// other* is wrong, so this reverses whole 2-byte chunks, never bytes
+    /// within a chunk. No-op for single-CID operands (nothing to reorder)
+    /// or odd-length byte strings (not 2-byte-CID data — e.g. a single-byte
+    /// CMap font, out of scope for this fix).
+    fn reverse_cid_pairs(bytes: &[u8]) -> Vec<u8> {
+        if bytes.len() % 2 != 0 || bytes.len() <= 2 {
+            return bytes.to_vec();
+        }
+        let mut out = Vec::with_capacity(bytes.len());
+        for chunk in bytes.chunks_exact(2).rev() {
+            out.extend_from_slice(chunk);
+        }
+        out
     }
 
     for op in &content.operations {
@@ -469,9 +501,29 @@ pub(crate) fn extract_page_text_items(
             "Tj" => {
                 // Show text string
                 if in_text_block && !op.operands.is_empty() {
+                    // Under `BMC /ReversedChars`, a CID-font operand packing
+                    // multiple CIDs into one string is stored in visual
+                    // order; reverse the CID sequence (not bytes within a
+                    // CID) before width/text decode. See `reverse_cid_pairs`
+                    // for why this leaves single-CID operands untouched.
+                    let is_cid_font = font_widths.get(&current_font).is_some_and(|fi| fi.is_cid);
+                    let reversed_operand: Object = if reversed_chars_active(&marked_content_stack)
+                        && is_cid_font
+                    {
+                        match get_operand_bytes(&op.operands[0]) {
+                            Some(raw) => Object::String(
+                                reverse_cid_pairs(raw),
+                                lopdf::StringFormat::Hexadecimal,
+                            ),
+                            None => op.operands[0].clone(),
+                        }
+                    } else {
+                        op.operands[0].clone()
+                    };
+
                     // Advance text matrix regardless of visibility
                     let w_ts_opt = font_widths.get(&current_font).and_then(|fi| {
-                        get_operand_bytes(&op.operands[0]).map(|raw| {
+                        get_operand_bytes(&reversed_operand).map(|raw| {
                             compute_string_width_ts(
                                 raw,
                                 fi,
@@ -501,11 +553,7 @@ pub(crate) fn extract_page_text_items(
                     // For Mixed/template PDFs, include_invisible=true extracts
                     // the OCR text layer that sits behind scanned images.
                     if text_rendering_mode == 3 && !include_invisible {
-                        if op
-                            .operands
-                            .first()
-                            .and_then(get_operand_bytes)
-                            .is_some_and(|raw| !raw.is_empty())
+                        if get_operand_bytes(&reversed_operand).is_some_and(|raw| !raw.is_empty())
                         {
                             skipped_invisible = true;
                         }
@@ -516,7 +564,7 @@ pub(crate) fn extract_page_text_items(
                         continue;
                     }
                     if let Some(text) = extract_text_from_operand(
-                        &op.operands[0],
+                        &reversed_operand,
                         &current_font,
                         font_base_names.get(&current_font).map(|s| s.as_str()),
                         font_cmaps,
@@ -584,6 +632,14 @@ pub(crate) fn extract_page_text_items(
                 if in_text_block && !op.operands.is_empty() {
                     if let Ok(array) = op.operands[0].as_array() {
                         let font_info = font_widths.get(&current_font);
+                        // See the identical comment in the "Tj" arm above —
+                        // same `BMC /ReversedChars` CID-reversal fix, applied
+                        // per string element of the TJ array (kerning
+                        // numbers between elements are left untouched; only
+                        // the CID order *within* a given string element is
+                        // reversed).
+                        let is_cid_font = font_info.is_some_and(|fi| fi.is_cid);
+                        let apply_reversal = reversed_chars_active(&marked_content_stack) && is_cid_font;
                         // Numeric-only TJ arrays (pure kerning) show no
                         // text — they must not trigger the invisible retry.
                         if text_rendering_mode == 3
@@ -675,8 +731,19 @@ pub(crate) fn extract_page_text_items(
                                 }
                                 _ => {}
                             }
+                            let reversed_element: Object = if apply_reversal {
+                                match get_operand_bytes(element) {
+                                    Some(raw) => Object::String(
+                                        reverse_cid_pairs(raw),
+                                        lopdf::StringFormat::Hexadecimal,
+                                    ),
+                                    None => element.clone(),
+                                }
+                            } else {
+                                element.clone()
+                            };
                             if let Some(fi) = font_info {
-                                if let Some(raw_bytes) = get_operand_bytes(element) {
+                                if let Some(raw_bytes) = get_operand_bytes(&reversed_element) {
                                     total_width_ts += compute_string_width_ts(
                                         raw_bytes,
                                         fi,
@@ -688,7 +755,7 @@ pub(crate) fn extract_page_text_items(
                             }
                             if !is_invisible {
                                 if let Some(text) = extract_text_from_operand(
-                                    element,
+                                    &reversed_element,
                                     &current_font,
                                     font_base_names.get(&current_font).map(|s| s.as_str()),
                                     font_cmaps,
@@ -940,15 +1007,24 @@ pub(crate) fn extract_page_text_items(
             }
             "BMC" => {
                 // Begin Marked Content (no properties)
+                let tag = op.operands.first().and_then(|o| match o {
+                    Object::Name(name) => Some(String::from_utf8_lossy(name).into_owned()),
+                    _ => None,
+                });
                 marked_content_stack.push(MarkedContentEntry {
                     actual_text: None,
                     mcid: None,
+                    tag,
                 });
             }
             "BDC" => {
                 // Begin Marked Content with properties — extract ActualText and MCID
                 let mut actual_text: Option<String> = None;
                 let mut mcid: Option<i64> = None;
+                let tag = op.operands.first().and_then(|o| match o {
+                    Object::Name(name) => Some(String::from_utf8_lossy(name).into_owned()),
+                    _ => None,
+                });
                 if op.operands.len() >= 2 {
                     let dict = match &op.operands[1] {
                         Object::Dictionary(d) => Some(d.clone()),
@@ -974,7 +1050,7 @@ pub(crate) fn extract_page_text_items(
                     actual_text_glyph_tm = None; // reset — will be captured at first Tj/TJ
                     actual_text_glyph_rise = None;
                 }
-                marked_content_stack.push(MarkedContentEntry { actual_text, mcid });
+                marked_content_stack.push(MarkedContentEntry { actual_text, mcid, tag });
             }
             "EMC" => {
                 // End Marked Content — emit ActualText item with correct width
