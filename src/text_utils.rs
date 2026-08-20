@@ -193,8 +193,28 @@ pub fn is_italic_font(font_name: &str) -> bool {
 /// Expand Unicode ligature characters to their component characters.
 /// This makes extracted text more searchable and semantically correct.
 /// Also applies NFKC normalization (converts Arabic presentation forms to base
-/// characters, decomposes Latin ligatures, etc.) and reverses visual-order
-/// Arabic text back to logical order when presentation forms are detected.
+/// characters, decomposes Latin ligatures, etc.).
+///
+/// Does NOT reverse text based on presentation-form presence alone — that
+/// heuristic was removed (see below) because presentation forms are not a
+/// reliable signal of visual-order storage: some fonts' ToUnicode CMaps use
+/// them purely as a glyph-shape encoding choice for text that is already in
+/// correct logical stream order (confirmed on a real DINNextLTArabic-based
+/// PDF, where reversing on that signal corrupted already-correct text, e.g.
+/// "خطة"/"مشتريات" decoded correctly from the raw CIDs and were then wrongly
+/// reversed). Genuine visual-order runs are instead handled where there's an
+/// actual structural signal for it — see `BMC /ReversedChars` handling in
+/// `extractor::content_stream` (`reversed_chars_active` /
+/// `reverse_cid_pairs`).
+///
+/// Known gap: some producers store a run in visual order with NO structural
+/// signal at all (confirmed on a real PowerPoint/Word-exported PDF: a short
+/// Arabic run's raw CIDs decode, byte-for-byte, straight to the wrong
+/// order — nothing to detect or correct here or in content_stream.rs). That
+/// case needs real bidi heuristics (pen-position analysis, à la MuPDF's
+/// guess_bidi_level()) to catch, which this crate does not implement. Not
+/// fixed by this function or anywhere else — do not assume presentation-form
+/// or `/ReversedChars` handling covers it.
 pub(crate) fn expand_ligatures(text: &str) -> String {
     // Strip null bytes and other control characters (except newline/tab)
     let text = if text
@@ -249,21 +269,23 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
         }
     }
 
-    // If the original text had Arabic presentation forms, the characters are in
-    // visual (LTR screen) order. After NFKC normalization, reverse to restore
-    // logical reading order.
-    if had_presentation_forms {
-        result = reverse_visual_arabic(&result);
-    }
-
     result
 }
 
 /// Reverse visual-order Arabic text to logical order.
 ///
+/// Currently unreferenced in production code — `expand_ligatures` stopped
+/// calling this unconditionally on presentation-form presence (see its doc
+/// comment for why that signal is unreliable). Kept, with its unit tests,
+/// as tested, ready-to-wire-up logic for whenever a real visual-order signal
+/// is available (only `BMC /ReversedChars` currently qualifies, and that's
+/// handled separately in `extractor::content_stream::reverse_cid_pairs` at
+/// the byte level, not here).
+///
 /// Pure RTL text (no ASCII alphanumerics) gets a simple character reversal.
 /// Mixed content (embedded numbers or Latin words) splits into LTR and non-LTR
 /// runs: run order is reversed, and only non-LTR runs are reversed internally.
+#[allow(dead_code)]
 fn reverse_visual_arabic(text: &str) -> String {
     // Check if there are any LTR runs (ASCII letters or digits)
     let has_ltr = text.chars().any(|c| c.is_ascii_alphanumeric());
@@ -899,11 +921,13 @@ mod tests {
 
     #[test]
     fn nfkc_arabic_presentation_forms() {
-        // Arabic Presentation Form-B: FEE1 = MEEM medial, FEF3 = YEH initial
-        // NFKC maps these to base Arabic + reversal restores logical order
-        let input = "\u{FEE1}\u{FEF3}"; // visual order: medial meem, initial yeh
+        // Arabic Presentation Form-B: FEE1 = MEEM medial, FEF3 = YEH initial.
+        // NFKC maps these to base Arabic. expand_ligatures does NOT reorder
+        // them (presentation-form presence alone is not a reliable
+        // visual-order signal — see the function's doc comment); this test
+        // only checks the normalization, not character order.
+        let input = "\u{FEE1}\u{FEF3}";
         let result = expand_ligatures(input);
-        // After NFKC: base Arabic chars; after reversal: logical order
         assert!(
             !result.chars().any(is_arabic_presentation_form),
             "presentation forms should be normalized: {result:?}"
