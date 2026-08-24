@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use content_stream::extract_page_text_items;
+pub(crate) use fonts::GlyphDecode;
 use links::{extract_form_fields, extract_page_links};
 
 // Re-export public types so existing `crate::extractor::X` paths keep working.
@@ -590,6 +591,99 @@ pub(crate) fn multiply_matrices(m1: &[f32; 6], m2: &[f32; 6]) -> [f32; 6] {
     ]
 }
 
+/// Phase 2 (pen-position tracking): fill in each glyph's `pen` — its own
+/// page-space `(x, y)` at the moment it's drawn — by walking a LOCAL copy
+/// of the operand's starting text matrix, advancing it by each glyph's own
+/// `glyph_advance_ts` in turn.
+///
+/// `start_tm` is the text matrix `TextItem.x`/`.y` are themselves computed
+/// from for this same operand — i.e. exactly what each call site already
+/// passes to `multiply_matrices(..., ctm)` to get its own `combined`/`x`/
+/// `y`. Callers must pass it pre-rise-adjusted if that call site applies
+/// text rise at all: content_stream.rs's Tj/TJ/' items are computed from
+/// `rise_adjusted(&text_matrix, text_rise)`, so its caller passes that;
+/// xobjects.rs's Form XObject text has no `text_rise` tracking at all (a
+/// pre-existing asymmetry between the two files, not something Phase 2
+/// changes), so its caller passes the bare `text_matrix`. This function
+/// itself is agnostic to rise — it only walks whatever starting matrix
+/// it's given.
+///
+/// The very first glyph's `pen` is therefore identical to
+/// `(combined[4], combined[5])` — the same values that operand's
+/// `TextItem.x`/`.y` get set to — since both start from the same matrix.
+/// This never mutates `start_tm` itself or feeds back into the real
+/// `text_matrix`/`TextItem.width` the rest of the pipeline computes from
+/// `compute_string_width_ts`'s aggregate.
+///
+/// Returns the (unadjusted) text matrix after advancing past every glyph —
+/// TJ's handler chains multiple calls across one array's string elements,
+/// each continuing where the last left off, exactly as `total_width_ts` is
+/// already threaded continuously through that same loop. Note this sum of
+/// per-glyph advances is not guaranteed bit-identical to
+/// `compute_string_width_ts`'s own aggregate for the same bytes (see
+/// `GlyphDecode::code_count`'s doc comment) — expect float-epsilon drift
+/// from the "real" text matrix over many chained calls, well below any
+/// geometry threshold pen-position tracking's own consumers care about.
+pub(crate) fn pen_track_glyphs(
+    glyphs: &mut [fonts::GlyphDecode],
+    start_tm: &[f32; 6],
+    ctm: &[f32; 6],
+    char_spacing: f32,
+    word_spacing: f32,
+) -> [f32; 6] {
+    let mut glyph_tm = *start_tm;
+    // A filler glyph (code_count == 0 — the 2nd+ character of a ligature
+    // CID, see GlyphDecode's doc) shares its real glyph's own pen position
+    // rather than getting the position after that real glyph's advance —
+    // mirroring MuPDF's fz_show_glyph_aux, which gives filler glyphs the
+    // SAME trm as the real glyph before them (both charge the CID's one
+    // advance to that shared position, not split across the pair).
+    // `last_real_pen` tracks that position; a filler is never first (a
+    // ligature CID always contributes its real glyph first), so this is
+    // always populated by the time a filler is reached.
+    let mut last_real_pen: Option<(f32, f32)> = None;
+    for g in glyphs.iter_mut() {
+        if g.code_count == 0 {
+            g.pen = last_real_pen;
+            continue;
+        }
+        let combined = multiply_matrices(&glyph_tm, ctm);
+        let pen = (combined[4], combined[5]);
+        g.pen = Some(pen);
+        last_real_pen = Some(pen);
+        let advance = fonts::glyph_advance_ts(g, char_spacing, word_spacing);
+        glyph_tm[4] += advance * glyph_tm[0];
+        glyph_tm[5] += advance * glyph_tm[1];
+    }
+    glyph_tm
+}
+
+/// Phase 2: TJ's kerning-driven space insertion (a synthetic ' ' pushed
+/// into `current_text` when a large enough negative displacement number
+/// appears between string elements, not decoded from any real CID/byte)
+/// gets a matching synthetic `GlyphDecode` — unlike
+/// `merge_text_items_with_glyphs`'s own synthetic space (which has no
+/// position available at merge time), this one DOES get a real pen
+/// position: `glyph_tm` is already being tracked continuously through the
+/// whole TJ array at the call site (both content_stream.rs's and
+/// xobjects.rs's TJ handlers), so the position is available for free at
+/// the moment the space is inserted.
+pub(crate) fn push_synthetic_space_glyph(
+    glyphs: &mut Vec<fonts::GlyphDecode>,
+    glyph_tm: &[f32; 6],
+    ctm: &[f32; 6],
+) {
+    let combined = multiply_matrices(glyph_tm, ctm);
+    glyphs.push(fonts::GlyphDecode {
+        text: " ".to_string(),
+        width_ts: 0.0,
+        cid: None,
+        code_count: 0,
+        space_count: 0,
+        pen: Some((combined[4], combined[5])),
+    });
+}
+
 /// Merge adjacent text items on the same line into single items.
 ///
 /// Groups items by (page, Y-position) with a 5pt tolerance, sorts within each
@@ -653,6 +747,15 @@ fn has_phrase_continuation_shape(text: &str) -> bool {
         .chars()
         .take(24)
         .any(|ch| ch.is_whitespace() || matches!(ch, '-'))
+}
+
+/// Adapter for `merge_text_items_with_glyphs`'s `(usize, &TextItem)`-tagged
+/// groups (Phase 2) — delegates to the unchanged, separately-tested
+/// function below with the indices stripped off, so that function's own
+/// logic and test suite need no changes.
+fn should_preserve_overlapping_stream_order_indexed(group: &[(usize, &TextItem)]) -> bool {
+    let items: Vec<&TextItem> = group.iter().map(|(_, item)| *item).collect();
+    should_preserve_overlapping_stream_order(&items)
 }
 
 fn should_preserve_overlapping_stream_order(group: &[&TextItem]) -> bool {
@@ -784,6 +887,21 @@ fn is_spaceless_cjk(c: char) -> bool {
         | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
         | '\u{FF00}'..='\u{FFEF}' // Halfwidth and Fullwidth Forms
     )
+}
+
+/// Adapter for `merge_text_items_with_glyphs`'s `(usize, &TextItem)`-tagged
+/// groups (Phase 2) — same rationale as
+/// `should_preserve_overlapping_stream_order_indexed` above. The returned
+/// index is a position within `group` (used for `j <= run_end` comparisons
+/// in the merge loop), which stays meaningful regardless of whether
+/// `group`'s elements are bare `&TextItem` or `(usize, &TextItem)` — only
+/// the element *type* differs, not the indexing.
+fn tracked_run_space_floor_indexed(
+    group: &[(usize, &TextItem)],
+    start: usize,
+) -> Option<(usize, f32)> {
+    let items: Vec<&TextItem> = group.iter().map(|(_, item)| *item).collect();
+    tracked_run_space_floor(&items, start)
 }
 
 fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, f32)> {
@@ -976,37 +1094,100 @@ fn trimmed_suffix(next: &TextItem) -> &str {
     next.text.trim()
 }
 
+// No production caller since Phase 2 (content_stream.rs calls
+// merge_text_items_with_glyphs directly, to carry glyphs through) — kept
+// for its own extensive existing unit test coverage of the merge
+// arithmetic in isolation, and as a convenience for any future caller that
+// genuinely has no glyphs to track.
+#[allow(dead_code)]
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
-    if items.is_empty() {
-        return items;
+    // Thin wrapper: pairs every item with an empty glyph vec (nothing to
+    // track for callers that don't have glyphs), runs the real
+    // implementation, then drops the glyph half. This guarantees, by
+    // construction rather than by separately-maintained duplicate logic,
+    // that TextItem's own fields (text/x/y/width/...) come out byte-
+    // identical whether or not a caller supplies glyphs — there is only
+    // one code path for the actual merge arithmetic (see
+    // merge_text_items_with_glyphs). Existing callers/tests of this
+    // function are unaffected by Phase 2 — same signature, same return
+    // type, same behavior.
+    let paired = items.into_iter().map(|it| (it, Vec::new())).collect();
+    merge_text_items_with_glyphs(paired)
+        .into_iter()
+        .map(|(it, _)| it)
+        .collect()
+}
+
+/// (original index into `items`/`item_glyphs`, &TextItem) — an item tagged
+/// with its position in the pre-merge arrays, so `item_glyphs[idx]` can be
+/// looked up after grouping/sorting has reordered/partitioned the items
+/// themselves. See `merge_text_items_with_glyphs`'s own comment on why.
+type IndexedItem<'a> = (usize, &'a TextItem);
+/// One (page, y) line group: the page/y grouping key, plus its
+/// `IndexedItem`s in original order (sorted in place afterward).
+type LineGroup<'a> = (u32, f32, Vec<IndexedItem<'a>>);
+/// A `LineGroup` plus the two flags decided once the group's items are
+/// known: whether it preserves original stream order, and whether it's RTL.
+type OrderedLineGroup<'a> = (u32, f32, Vec<IndexedItem<'a>>, bool, bool);
+
+/// Same algorithm as `merge_text_items` (line-grouping, RTL/LTR sort,
+/// gap-based merging into words/lines — see the inline comments below,
+/// unchanged from before Phase 2), but each `TextItem` carries its
+/// originating `Vec<GlyphDecode>` (from `decode_operand_glyphs`, pen
+/// positions filled in by the content-stream walker) alongside it, and a
+/// merged output item's glyph vec is the concatenation, in the same order,
+/// of the glyph vecs of every pre-merge item absorbed into it (with a
+/// synthetic space glyph inserted wherever the text-merge itself inserts a
+/// space — see the `text.push(' ')` site below).
+///
+/// This is the one place Phase 3 needs to change to add bidi detection:
+/// each `group`/merged run here already has its full per-glyph pen-
+/// position stream available, in the same visual/logical order the text
+/// itself is being assembled in.
+///
+/// `TextItem`'s own fields are computed by exactly the same expressions as
+/// `merge_text_items` always used — only glyph bookkeeping is new here;
+/// nothing about the position/width/text arithmetic changed for Phase 2.
+pub(crate) fn merge_text_items_with_glyphs(
+    paired: Vec<(TextItem, Vec<GlyphDecode>)>,
+) -> Vec<(TextItem, Vec<GlyphDecode>)> {
+    if paired.is_empty() {
+        return paired;
     }
 
-    // Group items by (page, Y position) with 5pt tolerance
-    let y_tolerance = 5.0;
-    let mut line_groups: Vec<(u32, f32, Vec<&TextItem>)> = Vec::new();
+    let (items, item_glyphs): (Vec<TextItem>, Vec<Vec<GlyphDecode>>) = paired.into_iter().unzip();
 
-    for item in &items {
+    // Group items by (page, Y position) with 5pt tolerance. Groups carry
+    // (original index into `items`/`item_glyphs`, &TextItem) pairs instead
+    // of bare &TextItem — purely additive: every existing access below
+    // reads `.1.field` (the same TextItem reference as before) unchanged;
+    // `.0` (the index) is only used to look up `item_glyphs`.
+    let y_tolerance = 5.0;
+    let mut line_groups: Vec<LineGroup> = Vec::new();
+
+    for (idx, item) in items.iter().enumerate() {
         let found = line_groups
             .iter_mut()
             .find(|(pg, y, _)| *pg == item.page && (item.y - *y).abs() < y_tolerance);
         if let Some((_, _, group)) = found {
-            group.push(item);
+            group.push((idx, item));
         } else {
-            line_groups.push((item.page, item.y, vec![item]));
+            line_groups.push((item.page, item.y, vec![(idx, item)]));
         }
     }
 
-    let mut ordered_line_groups: Vec<(u32, f32, Vec<&TextItem>, bool, bool)> = Vec::new();
+    let mut ordered_line_groups: Vec<OrderedLineGroup> = Vec::new();
 
     // Sort each group by X position (direction-aware), except for lines whose
     // content stream intentionally backtracks to overlay ActualText fragments.
     for (page, y, mut group) in line_groups {
-        let rtl = is_rtl_text(group.iter().map(|i| &i.text));
-        let preserve_stream_order = !rtl && should_preserve_overlapping_stream_order(&group);
+        let rtl = is_rtl_text(group.iter().map(|i| &i.1.text));
+        let preserve_stream_order =
+            !rtl && should_preserve_overlapping_stream_order_indexed(&group);
         if rtl {
-            group.sort_by(|a, b| b.x.total_cmp(&a.x));
+            group.sort_by(|a, b| b.1.x.total_cmp(&a.1.x));
         } else if !preserve_stream_order {
-            group.sort_by(|a, b| a.x.total_cmp(&b.x));
+            group.sort_by(|a, b| a.1.x.total_cmp(&b.1.x));
         }
         ordered_line_groups.push((page, y, group, preserve_stream_order, rtl));
     }
@@ -1019,7 +1200,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     for (_, _, group, preserve_stream_order, rtl) in &ordered_line_groups {
         let mut i = 0;
         while i < group.len() {
-            let first = group[i];
+            let (first_idx, first) = group[i];
             let mut text = first.text.clone();
             let mut end_x = first.x + effective_merge_width(first);
             // RTL-sorted groups (see the `group.sort_by` above) walk the line
@@ -1032,17 +1213,22 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
             let run_right_edge = end_x;
             let mut left_edge = first.x;
 
+            // Phase 2: this merged item's glyph stream, seeded with the
+            // first pre-merge item's glyphs; extended below in the same
+            // places the text/position merge itself absorbs a `next` item.
+            let mut glyphs = item_glyphs[first_idx].clone();
+
             // Tracked display text: run-local space floor overrides the
             // fixed thresholds for this run's junctions (see helper).
             let tracked = if *preserve_stream_order {
                 None
             } else {
-                tracked_run_space_floor(group, i)
+                tracked_run_space_floor_indexed(group, i)
             };
 
             let mut j = i + 1;
             while j < group.len() {
-                let next = group[j];
+                let (next_idx, next) = group[j];
                 // The adjacency gap between the run built so far and `next`.
                 // LTR (and stream-order-preserving) runs walk left-to-right,
                 // so the gap is measured from the run's rightmost edge
@@ -1131,8 +1317,23 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 };
                 if !small_caps_join && (needs_bullet_space || gap > effective_threshold) {
                     text.push(' ');
+                    // Synthetic space: not decoded from any real CID/byte
+                    // (this merge heuristic inserted it, the content stream
+                    // didn't), so it carries no code/width/position of its
+                    // own — `pen: None` is consistent with that field's
+                    // documented meaning ("not yet positioned"/not
+                    // applicable) elsewhere in GlyphDecode.
+                    glyphs.push(GlyphDecode {
+                        text: " ".to_string(),
+                        width_ts: 0.0,
+                        cid: None,
+                        code_count: 0,
+                        space_count: 0,
+                        pen: None,
+                    });
                 }
                 text.push_str(&next.text);
+                glyphs.extend(item_glyphs[next_idx].iter().cloned());
                 if *rtl {
                     // The run grows leftward: track the new leftmost edge.
                     left_edge = left_edge.min(next.x);
@@ -1157,22 +1358,25 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 (first.x, end_x - first.x)
             };
 
-            merged.push(TextItem {
-                text,
-                x: item_x,
-                y: first.y,
-                width: item_width,
-                height: first.height,
-                font: first.font.clone(),
-                font_size: first.font_size,
-                page: first.page,
-                is_bold: first.is_bold,
-                is_italic: first.is_italic,
-                is_underline: first.is_underline,
-                is_strikeout: first.is_strikeout,
-                item_type: first.item_type.clone(),
-                mcid: first.mcid,
-            });
+            merged.push((
+                TextItem {
+                    text,
+                    x: item_x,
+                    y: first.y,
+                    width: item_width,
+                    height: first.height,
+                    font: first.font.clone(),
+                    font_size: first.font_size,
+                    page: first.page,
+                    is_bold: first.is_bold,
+                    is_italic: first.is_italic,
+                    is_underline: first.is_underline,
+                    is_strikeout: first.is_strikeout,
+                    item_type: first.item_type.clone(),
+                    mcid: first.mcid,
+                },
+                glyphs,
+            ));
 
             i = j;
         }

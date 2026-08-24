@@ -1187,8 +1187,6 @@ fn font_file_data(doc: &Document, ff_ref: ObjectId) -> Option<Vec<u8>> {
     )
 }
 
-/// Decode text from a PDF string operand using font CMaps, encodings, and fallbacks.
-#[allow(clippy::too_many_arguments)]
 /// One decoded glyph position within a Tj/TJ/quote-operator string operand:
 /// its own decoded text, its own text-space advance width, and the CID (or
 /// single byte, for a simple font) it came from.
@@ -1220,9 +1218,55 @@ fn font_file_data(doc: &Document, ff_ref: ObjectId) -> Option<Vec<u8>> {
 ///     width, since there is no well-defined per-character split for these.
 #[derive(Debug, Clone)]
 pub(crate) struct GlyphDecode {
+    // `text`/`cid` aren't read by any production code yet — Phase 3 (bidi
+    // detection inside merge_text_items_with_glyphs) is the first
+    // consumer; `#[cfg(test)]` code already reads both (see the ligature
+    // regression test), just not counted by a non-test build.
+    #[allow(dead_code)]
     pub(crate) text: String,
     pub(crate) width_ts: f32,
+    #[allow(dead_code)]
     pub(crate) cid: Option<u16>,
+    /// How many underlying CID/byte codes this glyph represents, for
+    /// per-glyph Tc (char spacing) charging: 1 for a normal real glyph, 0
+    /// for a ligature filler (it doesn't consume a code of its own), and
+    /// the full underlying code count for an "opaque" glyph (a whole
+    /// operand collapsed to one pseudo-glyph — see `cid`'s doc above).
+    /// Phase 2 (pen-position tracking) uses this so
+    /// `glyph_advance_ts(g, Tc, Tw)`, summed over every glyph in an
+    /// operand, is provably consistent with `compute_string_width_ts`'s
+    /// whole-operand aggregate (`width_ts` sums to the same raw-width
+    /// term, `code_count` sums to the code count Tc is charged per, and
+    /// `space_count` sums to the space count Tw is charged per) — even
+    /// though, per `width_ts`'s own doc comment, summing `width_ts` alone
+    /// is not bit-identical to the aggregate.
+    pub(crate) code_count: u16,
+    /// How many of those codes were space codes (0x20 for a simple font,
+    /// CID 32 for a CID font), for per-glyph Tw (word spacing) charging —
+    /// see `code_count`.
+    pub(crate) space_count: u16,
+    /// Page-space pen position `(x, y)` at this glyph's own draw moment —
+    /// this glyph's text-rise-adjusted text matrix translation, mapped
+    /// through the CTM (the exact quantity `TextItem.x`/`.y` are computed
+    /// from for a whole operand, MuPDF's `trm.e`/`trm.f` per the Phase 1
+    /// research). `None` here: `decode_operand_glyphs` has no access to
+    /// `text_matrix`/`ctm`/`text_rise` (that state lives in the
+    /// content-stream walker, not the font-decode layer) — it is always
+    /// the caller's job (content_stream.rs/xobjects.rs) to fill this in
+    /// glyph-by-glyph, advancing a local copy of the text matrix by each
+    /// glyph's own `glyph_advance_ts`. A `Vec<GlyphDecode>` with `pen:
+    /// None` throughout means positioning hasn't run on it yet.
+    pub(crate) pen: Option<(f32, f32)>,
+}
+
+/// A glyph's own text-space advance, INCLUDING its share of Tc (char
+/// spacing) and Tw (word spacing) — unlike `width_ts` alone (glyph width
+/// only). This is the quantity a caller should add to a running pen-
+/// tracking text matrix between glyphs; see `GlyphDecode::code_count`'s
+/// doc comment for why summing it across an operand's glyphs reproduces
+/// `compute_string_width_ts`'s aggregate.
+pub(crate) fn glyph_advance_ts(g: &GlyphDecode, char_spacing: f32, word_spacing: f32) -> f32 {
+    g.width_ts + g.code_count as f32 * char_spacing + g.space_count as f32 * word_spacing
 }
 
 /// Build glyphs from a code-aligned decode: `units` and `widths` must be the
@@ -1239,10 +1283,11 @@ fn glyphs_from_aligned_units(
 ) -> Vec<GlyphDecode> {
     let mut out = Vec::with_capacity(units.len());
     for (i, (code, text)) in units.iter().enumerate() {
-        let w = widths
-            .get(i)
+        let rw = widths.get(i);
+        let w = rw
             .map(|rw| rw.raw_width * units_scale * font_size)
             .unwrap_or(0.0);
+        let is_space = rw.is_some_and(|rw| rw.is_space);
         let mut chars = text.as_deref().unwrap_or("").chars();
         match chars.next() {
             Some(first) => {
@@ -1250,12 +1295,21 @@ fn glyphs_from_aligned_units(
                     text: first.to_string(),
                     width_ts: w,
                     cid: Some(*code),
+                    code_count: 1,
+                    space_count: is_space as u16,
+                    pen: None,
                 });
                 for extra in chars {
+                    // Filler glyph: no code, no code_count/space_count — it
+                    // doesn't independently consume Tc/Tw, the CID above
+                    // already charged for both. See GlyphDecode's doc.
                     out.push(GlyphDecode {
                         text: extra.to_string(),
                         width_ts: 0.0,
                         cid: None,
+                        code_count: 0,
+                        space_count: 0,
+                        pen: None,
                     });
                 }
             }
@@ -1263,6 +1317,9 @@ fn glyphs_from_aligned_units(
                 text: String::new(),
                 width_ts: w,
                 cid: Some(*code),
+                code_count: 1,
+                space_count: is_space as u16,
+                pen: None,
             }),
         }
     }
@@ -1271,12 +1328,24 @@ fn glyphs_from_aligned_units(
 
 /// Build a single "opaque" glyph spanning a whole operand, for decode paths
 /// that aren't CID/byte-aligned with `widths` (see `GlyphDecode` docs).
-fn opaque_glyph(text: String, widths: &[RawGlyphWidth], units_scale: f32, font_size: f32) -> Vec<GlyphDecode> {
+/// `code_count`/`space_count` cover ALL underlying codes at once (there's
+/// no per-character split for these paths), so this one pseudo-glyph's
+/// `glyph_advance_ts` alone reproduces the whole operand's aggregate.
+fn opaque_glyph(
+    text: String,
+    widths: &[RawGlyphWidth],
+    units_scale: f32,
+    font_size: f32,
+) -> Vec<GlyphDecode> {
     let raw_total: f32 = widths.iter().map(|w| w.raw_width).sum();
+    let space_count = widths.iter().filter(|w| w.is_space).count();
     vec![GlyphDecode {
         text,
         width_ts: raw_total * units_scale * font_size,
         cid: None,
+        code_count: widths.len() as u16,
+        space_count: space_count as u16,
+        pen: None,
     }]
 }
 
@@ -1299,6 +1368,10 @@ fn units_to_string(units: &[(u16, Option<String>)]) -> String {
 /// exactly, in the same order, with the same conditions — see
 /// `extract_text_from_operand`'s original doc comment history / the Phase 1
 /// research notes for the branch-by-branch trace this mirrors.
+///
+/// Decode text from a PDF string operand using font CMaps, encodings, and
+/// fallbacks.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_operand_glyphs(
     obj: &Object,
     current_font: &str,
@@ -1575,7 +1648,10 @@ pub(crate) fn decode_operand_glyphs(
                             // Base encoding fallback for printable bytes.
                             // Most PDFs with simple fonts use WinAnsi/PDFDocEncoding
                             // semantics, not ISO-8859-1 C1 controls.
-                            Some(decode_single_byte_fallback_char(b, use_cp1252_fallback).to_string())
+                            Some(
+                                decode_single_byte_fallback_char(b, use_cp1252_fallback)
+                                    .to_string(),
+                            )
                         } else {
                             None // Skip unmapped control characters
                         };
@@ -1697,6 +1773,11 @@ pub(crate) fn decode_operand_glyphs(
     (text, result_glyphs)
 }
 
+// No production caller since Phase 1 (content_stream.rs/xobjects.rs call
+// decode_operand_glyphs directly, for the per-glyph breakdown) — kept for
+// its own unit test coverage of the text-only decode path in isolation.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_text_from_operand(
     obj: &Object,
     current_font: &str,
@@ -2378,7 +2459,10 @@ endbfrange
         inline_cmaps.insert("F1".to_string(), entry);
 
         let mut font_widths: PageFontWidths = HashMap::new();
-        font_widths.insert("F1".to_string(), make_font_info(&[(0x01D9, 680)], 1000, true));
+        font_widths.insert(
+            "F1".to_string(),
+            make_font_info(&[(0x01D9, 680)], 1000, true),
+        );
 
         let bytes = vec![0x01u8, 0xD9]; // CID 0x01D9, big-endian
         let obj = Object::String(bytes.clone(), lopdf::StringFormat::Hexadecimal);
@@ -2406,7 +2490,11 @@ endbfrange
         );
 
         assert_eq!(text.as_deref(), Some("لا"));
-        assert_eq!(glyphs.len(), 2, "one real + one filler glyph, not one per string");
+        assert_eq!(
+            glyphs.len(),
+            2,
+            "one real + one filler glyph, not one per string"
+        );
 
         assert_eq!(glyphs[0].text, "ل");
         assert_eq!(glyphs[0].cid, Some(0x01D9));
@@ -2416,16 +2504,281 @@ endbfrange
             "first glyph should carry the CID's real width, got {}",
             glyphs[0].width_ts
         );
+        // Phase 2: the real glyph represents exactly the 1 underlying CID
+        // (Tc-chargeable), and it isn't a space (CID != 32) so no Tw.
+        assert_eq!(glyphs[0].code_count, 1);
+        assert_eq!(glyphs[0].space_count, 0);
+        assert_eq!(
+            glyphs[0].pen, None,
+            "pen position is the caller's job, unset here"
+        );
 
         assert_eq!(glyphs[1].text, "ا");
         assert_eq!(glyphs[1].cid, None, "filler glyph has no CID of its own");
         assert_eq!(glyphs[1].width_ts, 0.0, "filler glyph must be zero-width");
+        // Phase 2: the filler doesn't independently consume a code — the
+        // real glyph above already charged Tc/Tw for the whole CID.
+        assert_eq!(glyphs[1].code_count, 0);
+        assert_eq!(glyphs[1].space_count, 0);
 
         // The aggregate that actually drives positioning is untouched by
         // Phase 1 — same value the pre-refactor two-function code produced.
         let fi = font_widths.get("F1").unwrap();
         let agg = compute_string_width_ts(&bytes, fi, 12.0, 0.0, 0.0);
         assert!((agg - expected_width).abs() < 0.001);
+
+        // Phase 2: glyph_advance_ts, summed over both glyphs, reproduces
+        // that same aggregate — the property pen-position tracking relies
+        // on (see glyph_advance_ts's doc comment).
+        let summed: f32 = glyphs.iter().map(|g| glyph_advance_ts(g, 0.0, 0.0)).sum();
+        assert!((summed - agg).abs() < 0.001);
+    }
+
+    #[test]
+    fn pen_track_glyphs_simple_ltr_advances_left_to_right() {
+        // Phase 2, verification requirement 3 (simple case): a plain LTR
+        // run should have each glyph's pen.x strictly increasing by that
+        // glyph's own advance, pen.y unchanged — no CMap/font machinery
+        // needed, this only exercises pen_track_glyphs itself.
+        let fi = make_font_info(
+            &[(b'A' as u16, 600), (b'B' as u16, 500), (b'C' as u16, 700)],
+            500,
+            false,
+        );
+        let bytes = b"ABC";
+        let (units, failed) = {
+            // Simple (non-CID) font: one "unit" per byte, decoded text is
+            // irrelevant here — build GlyphDecode directly via the same
+            // real code path decode_operand_glyphs uses for simple fonts.
+            let cmap_content = br#"
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+3 beginbfchar
+<41> <0041>
+<42> <0042>
+<43> <0043>
+endbfchar
+"#;
+            let cmap = crate::tounicode::ToUnicodeCMap::parse(cmap_content).unwrap();
+            assert_eq!(cmap.code_byte_length, 1);
+            cmap.decode_cids_glyphs(bytes)
+        };
+        assert!(!failed);
+        let widths: Vec<RawGlyphWidth> = raw_glyph_widths(bytes, &fi);
+        let glyphs_vec = glyphs_from_aligned_units(&units, &widths, fi.units_scale, 10.0);
+        let mut glyphs = glyphs_vec;
+
+        let font_size = 10.0;
+        let _ = font_size; // already baked into glyphs_from_aligned_units above
+        let start_tm = [1.0, 0.0, 0.0, 1.0, 100.0, 700.0];
+        let ctm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let end_tm = crate::extractor::pen_track_glyphs(&mut glyphs, &start_tm, &ctm, 0.0, 0.0);
+
+        assert_eq!(glyphs.len(), 3);
+        // A=600 units, B=500, C=700, units_scale=0.001, font_size=10 =>
+        // advances 6.0, 5.0, 7.0
+        let a_pen = glyphs[0].pen.expect("pen must be set");
+        let b_pen = glyphs[1].pen.expect("pen must be set");
+        let c_pen = glyphs[2].pen.expect("pen must be set");
+        assert!(
+            (a_pen.0 - 100.0).abs() < 0.001,
+            "first glyph starts at Tm's x"
+        );
+        assert!(
+            (a_pen.1 - 700.0).abs() < 0.001,
+            "y unchanged for horizontal text"
+        );
+        assert!(
+            (b_pen.0 - 106.0).abs() < 0.001,
+            "B starts after A's 6.0 advance"
+        );
+        assert!(
+            (c_pen.0 - 111.0).abs() < 0.001,
+            "C starts after A+B's 6.0+5.0 advance"
+        );
+        // Strictly increasing x, unchanged y — the LTR property this test
+        // exists to check.
+        assert!(a_pen.0 < b_pen.0 && b_pen.0 < c_pen.0);
+        assert_eq!(a_pen.1, b_pen.1);
+        assert_eq!(b_pen.1, c_pen.1);
+        assert!(
+            (end_tm[4] - 118.0).abs() < 0.001,
+            "ending matrix past C's 7.0 advance"
+        );
+    }
+
+    #[test]
+    fn pen_track_glyphs_matches_real_fixture_dump_ops_trace() {
+        // Phase 2, verification requirement 3 (real RTL case): the exact
+        // CID sequence `<011001d9> -5 <0164> 4 <0113>` traced via dump_ops
+        // from a real production fixture
+        // (نموذج_كراسة_عام.pdf, page 6, font /F1 BCDEEE+DINNextLTArabic-
+        // Regular, Tf 11.04, Tm [1 0 0 1 477.7 553.27]) — the same run
+        // containing the Lam-Alef ligature CID (0x01D9 -> "لا") Phase 1's
+        // own ligature test uses, here with its real dump_ops-observed
+        // neighbors and kerning numbers. Font-unit widths below (CID ->
+        // width) are read directly from that font's own /W array in the
+        // real PDF: 0x0110->281, 0x01D9->680, 0x0164->265, 0x0113->224 —
+        // not fabricated. Expected positions are hand-computed from those
+        // same real widths/kerning/Tm using the PDF spec's own tx formula
+        // (independently of pen_track_glyphs's implementation, just using
+        // the same inputs) — see the arithmetic in each assertion's
+        // comment.
+        let cmap_content = br#"
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+3 beginbfchar
+<0110> <0645>
+<0164> <062F>
+<0113> <0020>
+endbfchar
+1 beginbfrange
+<01D9> <01D9> [<06440627>]
+endbfrange
+"#;
+        let cmap = crate::tounicode::ToUnicodeCMap::parse(cmap_content).unwrap();
+        let entry = crate::tounicode::CMapEntry {
+            primary: cmap,
+            remapped: None,
+            fallback: None,
+        };
+        let mut inline_cmaps = HashMap::new();
+        inline_cmaps.insert("F1".to_string(), entry);
+
+        let mut font_widths: PageFontWidths = HashMap::new();
+        font_widths.insert(
+            "F1".to_string(),
+            make_font_info(
+                &[(0x0110, 281), (0x01D9, 680), (0x0164, 265), (0x0113, 224)],
+                1000,
+                true,
+            ),
+        );
+
+        let font_cmaps = FontCMaps::default();
+        let font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        let font_encodings: PageFontEncodings = HashMap::new();
+        let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
+        let mut decisions = CMapDecisionCache::new();
+
+        // The array's 2 string elements, decoded independently exactly as
+        // content_stream.rs's TJ handler does, with the SAME real kerning
+        // number (-5, in thousandths of an em) between them.
+        let font_size = 11.04f32;
+        let obj1 = Object::String(
+            vec![0x01, 0x10, 0x01, 0xD9],
+            lopdf::StringFormat::Hexadecimal,
+        );
+        let (_, mut glyphs1) = decode_operand_glyphs(
+            &obj1,
+            "F1",
+            None,
+            &font_cmaps,
+            &font_tounicode_refs,
+            &inline_cmaps,
+            &font_encodings,
+            &encoding_cache,
+            &mut decisions,
+            &font_widths,
+            font_size,
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            glyphs1.len(),
+            3,
+            "CID 0x0110 (1 glyph) + CID 0x01D9 (real+filler)"
+        );
+
+        let obj2 = Object::String(vec![0x01, 0x64], lopdf::StringFormat::Hexadecimal);
+        let (_, mut glyphs2) = decode_operand_glyphs(
+            &obj2,
+            "F1",
+            None,
+            &font_cmaps,
+            &font_tounicode_refs,
+            &inline_cmaps,
+            &font_encodings,
+            &encoding_cache,
+            &mut decisions,
+            &font_widths,
+            font_size,
+            0.0,
+            0.0,
+        );
+
+        let obj3 = Object::String(vec![0x01, 0x13], lopdf::StringFormat::Hexadecimal);
+        let (_, mut glyphs3) = decode_operand_glyphs(
+            &obj3,
+            "F1",
+            None,
+            &font_cmaps,
+            &font_tounicode_refs,
+            &inline_cmaps,
+            &font_encodings,
+            &encoding_cache,
+            &mut decisions,
+            &font_widths,
+            font_size,
+            0.0,
+            0.0,
+        );
+
+        let start_tm = [1.0f32, 0.0, 0.0, 1.0, 477.7, 553.27];
+        let ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+        // Element 1: <011001d9>
+        let tm_after_1 =
+            crate::extractor::pen_track_glyphs(&mut glyphs1, &start_tm, &ctm, 0.0, 0.0);
+        // Kerning -5 (thousandths of em): displacement = -(-5)/1000*11.04 = +0.0552
+        let mut tm_after_kern1 = tm_after_1;
+        tm_after_kern1[4] += 5.0 / 1000.0 * font_size;
+        // Element 2: <0164>
+        let tm_after_2 =
+            crate::extractor::pen_track_glyphs(&mut glyphs2, &tm_after_kern1, &ctm, 0.0, 0.0);
+        // Kerning 4: displacement = -4/1000*11.04 = -0.04416
+        let mut tm_after_kern2 = tm_after_2;
+        tm_after_kern2[4] -= 4.0 / 1000.0 * font_size;
+        // Element 3: <0113>
+        crate::extractor::pen_track_glyphs(&mut glyphs3, &tm_after_kern2, &ctm, 0.0, 0.0);
+
+        // CID 0x0110 (width 281): pen == Tm's own start.
+        let pen_0110 = glyphs1[0].pen.expect("pen must be set");
+        assert!((pen_0110.0 - 477.7).abs() < 0.01, "got {}", pen_0110.0);
+        assert!((pen_0110.1 - 553.27).abs() < 0.01);
+
+        // CID 0x01D9 real glyph "ل": 477.7 + 281*0.001*11.04 = 477.7 + 3.10224 = 480.80224
+        let pen_01d9_real = glyphs1[1].pen.expect("pen must be set");
+        assert!(
+            (pen_01d9_real.0 - 480.80224).abs() < 0.01,
+            "got {}",
+            pen_01d9_real.0
+        );
+
+        // Filler "ا": same position as the real glyph before it (0 advance).
+        let pen_01d9_filler = glyphs1[2].pen.expect("pen must be set");
+        assert!(
+            (pen_01d9_filler.0 - pen_01d9_real.0).abs() < 0.0001,
+            "filler must not move the pen"
+        );
+
+        // CID 0x0164 (width 265), after the -5 kerning bump:
+        // 480.80224 + 680*0.001*11.04 + 5/1000*11.04
+        //   = 480.80224 + 7.5072 + 0.0552 = 488.36464
+        let pen_0164 = glyphs2[0].pen.expect("pen must be set");
+        assert!((pen_0164.0 - 488.36464).abs() < 0.01, "got {}", pen_0164.0);
+
+        // CID 0x0113 (width 224), after the +4 kerning bump (displacement -0.04416):
+        // 488.36464 + 265*0.001*11.04 - 4/1000*11.04 = 488.36464 + 2.9256 - 0.04416 = 491.24608
+        let pen_0113 = glyphs3[0].pen.expect("pen must be set");
+        assert!((pen_0113.0 - 491.24608).abs() < 0.01, "got {}", pen_0113.0);
+
+        // y never changes across this whole horizontal run.
+        for pen in [pen_0110, pen_01d9_real, pen_01d9_filler, pen_0164, pen_0113] {
+            assert!((pen.1 - 553.27).abs() < 0.01);
+        }
     }
 
     #[test]

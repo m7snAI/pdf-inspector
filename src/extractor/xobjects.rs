@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use super::fonts::{
     build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
     decode_operand_glyphs, get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
-    FontStyleCache,
+    FontStyleCache, GlyphDecode,
 };
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
@@ -189,7 +189,7 @@ pub(crate) fn extract_form_xobject_text(
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     budget: &mut FormWalkBudget,
-) -> Vec<TextItem> {
+) -> (Vec<TextItem>, Vec<Vec<GlyphDecode>>) {
     extract_form_xobject_text_inner(
         doc,
         form_id,
@@ -214,16 +214,20 @@ fn extract_form_xobject_text_inner(
     style_cache: &mut FontStyleCache,
     depth: u8,
     budget: &mut FormWalkBudget,
-) -> Vec<TextItem> {
+) -> (Vec<TextItem>, Vec<Vec<GlyphDecode>>) {
     let mut items = Vec::new();
+    // Phase 2: parallel to `items` — see content_stream.rs's own
+    // item_glyphs for the full rationale. Every items.push/extend below has
+    // a matching item_glyphs.push/extend.
+    let mut item_glyphs: Vec<Vec<GlyphDecode>> = Vec::new();
 
     if !budget.charge_invocation() {
-        return items;
+        return (items, item_glyphs);
     }
 
     // Get the Form XObject stream
     let Ok(Object::Stream(stream)) = doc.get_object(form_id) else {
-        return items;
+        return (items, item_glyphs);
     };
 
     // Decompress the content stream (fall back to raw bytes for uncompressed streams)
@@ -238,7 +242,7 @@ fn extract_form_xobject_text_inner(
         &content_data,
         super::content_decode::MAX_PAGE_OPERATIONS,
     ) else {
-        return items;
+        return (items, item_glyphs);
     };
 
     // Get fonts from the Form's Resources
@@ -393,18 +397,20 @@ fn extract_form_xobject_text_inner(
                         match form_xobjects.get(&xobj_name) {
                             Some(XObjectType::Form(nested_id)) => {
                                 if depth < MAX_FORM_XOBJECT_DEPTH && !budget.exhausted() {
-                                    let nested_items = extract_form_xobject_text_inner(
-                                        doc,
-                                        *nested_id,
-                                        page_num,
-                                        font_cmaps,
-                                        &ctm,
-                                        cmap_decisions,
-                                        style_cache,
-                                        depth + 1,
-                                        budget,
-                                    );
+                                    let (nested_items, nested_glyphs) =
+                                        extract_form_xobject_text_inner(
+                                            doc,
+                                            *nested_id,
+                                            page_num,
+                                            font_cmaps,
+                                            &ctm,
+                                            cmap_decisions,
+                                            style_cache,
+                                            depth + 1,
+                                            budget,
+                                        );
                                     items.extend(nested_items);
+                                    item_glyphs.extend(nested_glyphs);
                                 }
                             }
                             Some(XObjectType::Image) => {
@@ -413,6 +419,9 @@ fn extract_form_xobject_text_inner(
                                 // inside Form XObjects (common in print-to-PDF
                                 // workflows) aren't silently dropped.
                                 let (x, y, width, height) = image_bbox_from_ctm(&ctm);
+                                // Phase 2: not from decode_operand_glyphs — no
+                                // glyphs to attach.
+                                item_glyphs.push(Vec::new());
                                 items.push(TextItem {
                                     text: format!("[Image: {}]", xobj_name),
                                     x,
@@ -574,7 +583,7 @@ fn extract_form_xobject_text_inner(
                     // "Tj" arm) — the separate compute_string_width_ts calls
                     // around this one are untouched and remain the sole
                     // source of the aggregate widths used for positioning.
-                    let (decoded_text, _glyphs) = decode_operand_glyphs(
+                    let (decoded_text, mut glyphs) = decode_operand_glyphs(
                         show_operand,
                         &current_font,
                         font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -623,6 +632,18 @@ fn extract_form_xobject_text_inner(
                                 .get(&current_font)
                                 .copied()
                                 .unwrap_or((false, false));
+                            // Phase 2: no text_rise tracking in this file
+                            // (pre-existing, see pen_track_glyphs's own doc
+                            // comment) — bare text_matrix, matching `combined`
+                            // above exactly.
+                            super::pen_track_glyphs(
+                                &mut glyphs,
+                                &text_matrix,
+                                &ctm,
+                                char_spacing,
+                                word_spacing,
+                            );
+                            item_glyphs.push(glyphs);
                             items.push(TextItem {
                                 text: expand_ligatures(&text),
                                 x,
@@ -666,6 +687,14 @@ fn extract_form_xobject_text_inner(
                         let mut current_text = String::new();
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
+                        // Phase 2: see content_stream.rs's TJ arm for the
+                        // full rationale — parallel glyph accumulators plus
+                        // a continuously-tracked pen matrix across the whole
+                        // array. No text_rise here (pre-existing asymmetry,
+                        // see pen_track_glyphs's doc comment).
+                        let mut sub_items_glyphs: Vec<Vec<GlyphDecode>> = Vec::new();
+                        let mut current_glyphs: Vec<GlyphDecode> = Vec::new();
+                        let mut glyph_tm = text_matrix;
                         for element in array {
                             match element {
                                 Object::Integer(n) => {
@@ -680,6 +709,7 @@ fn extract_form_xobject_text_inner(
                                             sub_start_width_ts,
                                             total_width_ts,
                                         ));
+                                        sub_items_glyphs.push(std::mem::take(&mut current_glyphs));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
                                     } else {
@@ -690,8 +720,15 @@ fn extract_form_xobject_text_inner(
                                             && !current_text.ends_with(' ')
                                         {
                                             current_text.push(' ');
+                                            super::push_synthetic_space_glyph(
+                                                &mut current_glyphs,
+                                                &glyph_tm,
+                                                &ctm,
+                                            );
                                         }
                                     }
+                                    glyph_tm[4] += displacement * glyph_tm[0];
+                                    glyph_tm[5] += displacement * glyph_tm[1];
                                     continue;
                                 }
                                 Object::Real(n) => {
@@ -706,6 +743,7 @@ fn extract_form_xobject_text_inner(
                                             sub_start_width_ts,
                                             total_width_ts,
                                         ));
+                                        sub_items_glyphs.push(std::mem::take(&mut current_glyphs));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
                                     } else {
@@ -716,8 +754,15 @@ fn extract_form_xobject_text_inner(
                                             && !current_text.ends_with(' ')
                                         {
                                             current_text.push(' ');
+                                            super::push_synthetic_space_glyph(
+                                                &mut current_glyphs,
+                                                &glyph_tm,
+                                                &ctm,
+                                            );
                                         }
                                     }
+                                    glyph_tm[4] += displacement * glyph_tm[0];
+                                    glyph_tm[5] += displacement * glyph_tm[1];
                                     continue;
                                 }
                                 _ => {}
@@ -740,7 +785,7 @@ fn extract_form_xobject_text_inner(
                                 // total_width_ts above (via
                                 // compute_string_width_ts, untouched) remains
                                 // the sole aggregate width.
-                                let (decoded_text, _glyphs) = decode_operand_glyphs(
+                                let (decoded_text, mut elem_glyphs) = decode_operand_glyphs(
                                     element,
                                     &current_font,
                                     font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -755,6 +800,14 @@ fn extract_form_xobject_text_inner(
                                     char_spacing,
                                     word_spacing,
                                 );
+                                glyph_tm = super::pen_track_glyphs(
+                                    &mut elem_glyphs,
+                                    &glyph_tm,
+                                    &ctm,
+                                    char_spacing,
+                                    word_spacing,
+                                );
+                                current_glyphs.extend(elem_glyphs);
                                 if let Some(text) = decoded_text {
                                     current_text.push_str(&text);
                                 }
@@ -762,6 +815,7 @@ fn extract_form_xobject_text_inner(
                         }
                         if !fill_is_white && !current_text.trim().is_empty() {
                             sub_items.push((current_text, sub_start_width_ts, total_width_ts));
+                            sub_items_glyphs.push(current_glyphs);
                         }
                         if !sub_items.is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
@@ -776,7 +830,10 @@ fn extract_form_xobject_text_inner(
                                 .copied()
                                 .unwrap_or((false, false));
                             let scale_x = text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2];
-                            for (text, start_w, end_w) in &sub_items {
+                            debug_assert_eq!(sub_items.len(), sub_items_glyphs.len());
+                            for ((text, start_w, end_w), glyphs) in
+                                sub_items.iter().zip(sub_items_glyphs)
+                            {
                                 let offset_tm = [
                                     text_matrix[0],
                                     text_matrix[1],
@@ -792,6 +849,7 @@ fn extract_form_xobject_text_inner(
                                 } else {
                                     0.0
                                 };
+                                item_glyphs.push(glyphs);
                                 items.push(TextItem {
                                     text: expand_ligatures(text),
                                     x,
@@ -826,7 +884,7 @@ fn extract_form_xobject_text_inner(
         }
     }
 
-    items
+    (items, item_glyphs)
 }
 
 /// Get fonts from a Form XObject's Resources
@@ -964,6 +1022,9 @@ mod tests {
         form_id: ObjectId,
         budget: &mut FormWalkBudget,
     ) -> Vec<TextItem> {
+        // Phase 2 added a parallel Vec<Vec<GlyphDecode>> return — existing
+        // callers of this test helper only care about TextItem, so drop it
+        // here rather than touching every call site.
         extract_form_xobject_text(
             doc,
             form_id,
@@ -974,6 +1035,7 @@ mod tests {
             &mut FontStyleCache::new(),
             budget,
         )
+        .0
     }
 
     #[test]

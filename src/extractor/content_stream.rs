@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use super::fonts::{
     build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
     decode_operand_glyphs, descriptor_style_flags, get_font_file2_obj_num, get_operand_bytes,
-    CMapDecisionCache, FontStyleCache,
+    CMapDecisionCache, FontStyleCache, GlyphDecode,
 };
 use super::underline::UnderlineLine;
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
@@ -152,6 +152,13 @@ pub(crate) fn extract_page_text_items(
     form_budget: &mut FormWalkBudget,
 ) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
     let mut items = Vec::new();
+    // Phase 2: parallel to `items` — item_glyphs[i] is the per-glyph
+    // (with pen positions) breakdown of items[i]'s decoded text, for the
+    // TextItems that come from decode_operand_glyphs (Tj/TJ/'). The other
+    // two TextItem sources in this function (image placeholders,
+    // ActualText substitution) don't decode glyphs at all, so they push an
+    // empty Vec here to keep the two vecs the same length/order.
+    let mut item_glyphs: Vec<Vec<GlyphDecode>> = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
     let mut clip_rects: Vec<PdfRect> = Vec::new();
     let mut lines: Vec<PdfLine> = Vec::new();
@@ -334,7 +341,9 @@ pub(crate) fn extract_page_text_items(
     /// left-to-right) order rather than logical reading order, and must be
     /// reversed to recover it. See `reverse_cid_pairs` below.
     fn reversed_chars_active(stack: &[MarkedContentEntry]) -> bool {
-        stack.iter().any(|e| e.tag.as_deref() == Some("ReversedChars"))
+        stack
+            .iter()
+            .any(|e| e.tag.as_deref() == Some("ReversedChars"))
     }
     /// Reverse the order of 2-byte CID codes within a raw PDF string
     /// operand, without touching the bytes *within* each CID.
@@ -349,7 +358,7 @@ pub(crate) fn extract_page_text_items(
     /// or odd-length byte strings (not 2-byte-CID data — e.g. a single-byte
     /// CMap font, out of scope for this fix).
     fn reverse_cid_pairs(bytes: &[u8]) -> Vec<u8> {
-        if bytes.len() % 2 != 0 || bytes.len() <= 2 {
+        if !bytes.len().is_multiple_of(2) || bytes.len() <= 2 {
             return bytes.to_vec();
         }
         let mut out = Vec::with_capacity(bytes.len());
@@ -507,19 +516,18 @@ pub(crate) fn extract_page_text_items(
                     // CID) before width/text decode. See `reverse_cid_pairs`
                     // for why this leaves single-CID operands untouched.
                     let is_cid_font = font_widths.get(&current_font).is_some_and(|fi| fi.is_cid);
-                    let reversed_operand: Object = if reversed_chars_active(&marked_content_stack)
-                        && is_cid_font
-                    {
-                        match get_operand_bytes(&op.operands[0]) {
-                            Some(raw) => Object::String(
-                                reverse_cid_pairs(raw),
-                                lopdf::StringFormat::Hexadecimal,
-                            ),
-                            None => op.operands[0].clone(),
-                        }
-                    } else {
-                        op.operands[0].clone()
-                    };
+                    let reversed_operand: Object =
+                        if reversed_chars_active(&marked_content_stack) && is_cid_font {
+                            match get_operand_bytes(&op.operands[0]) {
+                                Some(raw) => Object::String(
+                                    reverse_cid_pairs(raw),
+                                    lopdf::StringFormat::Hexadecimal,
+                                ),
+                                None => op.operands[0].clone(),
+                            }
+                        } else {
+                            op.operands[0].clone()
+                        };
 
                     // Advance text matrix regardless of visibility
                     let w_ts_opt = font_widths.get(&current_font).and_then(|fi| {
@@ -553,8 +561,7 @@ pub(crate) fn extract_page_text_items(
                     // For Mixed/template PDFs, include_invisible=true extracts
                     // the OCR text layer that sits behind scanned images.
                     if text_rendering_mode == 3 && !include_invisible {
-                        if get_operand_bytes(&reversed_operand).is_some_and(|raw| !raw.is_empty())
-                        {
+                        if get_operand_bytes(&reversed_operand).is_some_and(|raw| !raw.is_empty()) {
                             skipped_invisible = true;
                         }
                         if let Some(w_ts) = w_ts_opt {
@@ -566,11 +573,12 @@ pub(crate) fn extract_page_text_items(
                     // Phase 1 (decode/width unification): decode_operand_glyphs
                     // replaces the old separate extract_text_from_operand call —
                     // same decode chain, now also producing a per-glyph
-                    // breakdown (unused here yet; a later phase wires it into
-                    // pen-position tracking). `w_ts_opt` above (from
-                    // compute_string_width_ts, untouched) remains the sole
-                    // source of the aggregate width used for positioning.
-                    let (decoded_text, _glyphs) = decode_operand_glyphs(
+                    // breakdown. `w_ts_opt` above (from compute_string_width_ts,
+                    // untouched) remains the sole source of the aggregate width
+                    // used for TextItem positioning — the pen-tracking below
+                    // (Phase 2) is a separate, parallel computation that never
+                    // feeds back into `text_matrix`/`x`/`y`/`width`.
+                    let (decoded_text, mut glyphs) = decode_operand_glyphs(
                         &reversed_operand,
                         &current_font,
                         font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -614,6 +622,19 @@ pub(crate) fn extract_page_text_items(
                                 .get(&current_font)
                                 .copied()
                                 .unwrap_or((false, false));
+                            // Phase 2: per-glyph pen positions, from the SAME
+                            // starting matrix `x`/`y` above were computed from
+                            // — a local copy inside pen_track_glyphs, so this
+                            // never perturbs the real `text_matrix` the rest
+                            // of the pipeline uses.
+                            super::pen_track_glyphs(
+                                &mut glyphs,
+                                &rise_adjusted(&text_matrix, text_rise),
+                                &ctm,
+                                char_spacing,
+                                word_spacing,
+                            );
+                            item_glyphs.push(glyphs);
                             items.push(TextItem {
                                 text: expand_ligatures(&text),
                                 x,
@@ -650,7 +671,8 @@ pub(crate) fn extract_page_text_items(
                         // the CID order *within* a given string element is
                         // reversed).
                         let is_cid_font = font_info.is_some_and(|fi| fi.is_cid);
-                        let apply_reversal = reversed_chars_active(&marked_content_stack) && is_cid_font;
+                        let apply_reversal =
+                            reversed_chars_active(&marked_content_stack) && is_cid_font;
                         // Numeric-only TJ arrays (pure kerning) show no
                         // text — they must not trigger the invisible retry.
                         if text_rendering_mode == 3
@@ -685,6 +707,16 @@ pub(crate) fn extract_page_text_items(
                         let mut current_text = String::new();
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
+                        // Phase 2: parallel to sub_items/current_text — one
+                        // glyph vec per sub_item, and the glyphs accumulated
+                        // so far for the sub_item currently being built.
+                        // `glyph_tm` tracks pen position continuously across
+                        // the WHOLE array (string elements AND kerning
+                        // numbers), exactly mirroring how total_width_ts is
+                        // already threaded through this same loop.
+                        let mut sub_items_glyphs: Vec<Vec<GlyphDecode>> = Vec::new();
+                        let mut current_glyphs: Vec<GlyphDecode> = Vec::new();
+                        let mut glyph_tm = rise_adjusted(&text_matrix, text_rise);
                         for element in array {
                             match element {
                                 Object::Integer(n) => {
@@ -700,6 +732,7 @@ pub(crate) fn extract_page_text_items(
                                             sub_start_width_ts,
                                             total_width_ts,
                                         ));
+                                        sub_items_glyphs.push(std::mem::take(&mut current_glyphs));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
                                     } else {
@@ -710,8 +743,15 @@ pub(crate) fn extract_page_text_items(
                                             && !current_text.ends_with(' ')
                                         {
                                             current_text.push(' ');
+                                            super::push_synthetic_space_glyph(
+                                                &mut current_glyphs,
+                                                &glyph_tm,
+                                                &ctm,
+                                            );
                                         }
                                     }
+                                    glyph_tm[4] += displacement * glyph_tm[0];
+                                    glyph_tm[5] += displacement * glyph_tm[1];
                                     continue;
                                 }
                                 Object::Real(n) => {
@@ -726,6 +766,7 @@ pub(crate) fn extract_page_text_items(
                                             sub_start_width_ts,
                                             total_width_ts,
                                         ));
+                                        sub_items_glyphs.push(std::mem::take(&mut current_glyphs));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
                                     } else {
@@ -736,8 +777,15 @@ pub(crate) fn extract_page_text_items(
                                             && !current_text.ends_with(' ')
                                         {
                                             current_text.push(' ');
+                                            super::push_synthetic_space_glyph(
+                                                &mut current_glyphs,
+                                                &glyph_tm,
+                                                &ctm,
+                                            );
                                         }
                                     }
+                                    glyph_tm[4] += displacement * glyph_tm[0];
+                                    glyph_tm[5] += displacement * glyph_tm[1];
                                     continue;
                                 }
                                 _ => {}
@@ -770,7 +818,7 @@ pub(crate) fn extract_page_text_items(
                                 // "Tj" arm's comment above. total_width_ts
                                 // above (via compute_string_width_ts,
                                 // untouched) remains the sole aggregate width.
-                                let (decoded_text, _glyphs) = decode_operand_glyphs(
+                                let (decoded_text, mut elem_glyphs) = decode_operand_glyphs(
                                     &reversed_element,
                                     &current_font,
                                     font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -785,6 +833,20 @@ pub(crate) fn extract_page_text_items(
                                     char_spacing,
                                     word_spacing,
                                 );
+                                // Phase 2: position this element's glyphs from
+                                // the running glyph_tm (continuous across the
+                                // whole array — see its declaration above),
+                                // then carry the resulting matrix forward for
+                                // whatever comes next (more text, a kerning
+                                // number, or the end of the array).
+                                glyph_tm = super::pen_track_glyphs(
+                                    &mut elem_glyphs,
+                                    &glyph_tm,
+                                    &ctm,
+                                    char_spacing,
+                                    word_spacing,
+                                );
+                                current_glyphs.extend(elem_glyphs);
                                 if let Some(text) = decoded_text {
                                     current_text.push_str(&text);
                                 }
@@ -793,6 +855,7 @@ pub(crate) fn extract_page_text_items(
                         // Flush remaining text
                         if !is_invisible && !current_text.trim().is_empty() {
                             sub_items.push((current_text, sub_start_width_ts, total_width_ts));
+                            sub_items_glyphs.push(current_glyphs);
                         }
                         // Emit one TextItem per sub-item
                         if !sub_items.is_empty() {
@@ -813,7 +876,10 @@ pub(crate) fn extract_page_text_items(
                                 .copied()
                                 .unwrap_or((false, false));
                             let scale_x = text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2];
-                            for (text, start_w, end_w) in &sub_items {
+                            debug_assert_eq!(sub_items.len(), sub_items_glyphs.len());
+                            for ((text, start_w, end_w), glyphs) in
+                                sub_items.iter().zip(sub_items_glyphs)
+                            {
                                 let offset_tm = [
                                     text_matrix[0],
                                     text_matrix[1],
@@ -830,6 +896,10 @@ pub(crate) fn extract_page_text_items(
                                 } else {
                                     0.0
                                 };
+                                // Phase 2: this sub-item's glyphs were already
+                                // pen-tracked incrementally as the array was
+                                // walked above — just carry them along.
+                                item_glyphs.push(glyphs);
                                 items.push(TextItem {
                                     text: expand_ligatures(text),
                                     x,
@@ -909,7 +979,7 @@ pub(crate) fn extract_page_text_items(
                     // comment above. w_ts_opt above (via
                     // compute_string_width_ts, untouched) remains the sole
                     // aggregate width.
-                    let (decoded_text, _glyphs) = decode_operand_glyphs(
+                    let (decoded_text, mut glyphs) = decode_operand_glyphs(
                         &op.operands[0],
                         &current_font,
                         font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -950,6 +1020,15 @@ pub(crate) fn extract_page_text_items(
                                 .get(&current_font)
                                 .copied()
                                 .unwrap_or((false, false));
+                            // Phase 2: see the "Tj" arm's comment above.
+                            super::pen_track_glyphs(
+                                &mut glyphs,
+                                &rise_adjusted(&text_matrix, text_rise),
+                                &ctm,
+                                char_spacing,
+                                word_spacing,
+                            );
+                            item_glyphs.push(glyphs);
                             items.push(TextItem {
                                 text: expand_ligatures(&text),
                                 x,
@@ -998,6 +1077,10 @@ pub(crate) fn extract_page_text_items(
                                     // `[Image: Im0]` format that the markdown
                                     // emitter already recognizes.
                                     let (x, y, width, height) = image_bbox_from_ctm(&ctm);
+                                    // Phase 2: not from decode_operand_glyphs
+                                    // — no glyphs to attach, keep item_glyphs
+                                    // aligned with items.
+                                    item_glyphs.push(Vec::new());
                                     items.push(TextItem {
                                         text: format!("[Image: {}]", xobj_name),
                                         x,
@@ -1017,7 +1100,7 @@ pub(crate) fn extract_page_text_items(
                                 }
                                 XObjectType::Form(form_id) => {
                                     // Extract text from Form XObject
-                                    let form_items = extract_form_xobject_text(
+                                    let (form_items, form_glyphs) = extract_form_xobject_text(
                                         doc,
                                         *form_id,
                                         page_num,
@@ -1028,6 +1111,7 @@ pub(crate) fn extract_page_text_items(
                                         form_budget,
                                     );
                                     items.extend(form_items);
+                                    item_glyphs.extend(form_glyphs);
                                 }
                             }
                         }
@@ -1079,7 +1163,11 @@ pub(crate) fn extract_page_text_items(
                     actual_text_glyph_tm = None; // reset — will be captured at first Tj/TJ
                     actual_text_glyph_rise = None;
                 }
-                marked_content_stack.push(MarkedContentEntry { actual_text, mcid, tag });
+                marked_content_stack.push(MarkedContentEntry {
+                    actual_text,
+                    mcid,
+                    tag,
+                });
             }
             "EMC" => {
                 // End Marked Content — emit ActualText item with correct width
@@ -1116,6 +1204,11 @@ pub(crate) fn extract_page_text_items(
                                     .get(&current_font)
                                     .copied()
                                     .unwrap_or((false, false));
+                                // Phase 2: `at` comes from the /ActualText
+                                // dictionary value, not decode_operand_glyphs
+                                // — no glyphs to attach, keep item_glyphs
+                                // aligned with items.
+                                item_glyphs.push(Vec::new());
                                 items.push(TextItem {
                                     text: expand_ligatures(&at),
                                     x,
@@ -1449,8 +1542,8 @@ pub(crate) fn extract_page_text_items(
     // Some PDFs embed landscape content in portrait pages using a rotated text
     // matrix (e.g. [0, b, -b, 0, tx, ty] for 90° CCW).  The layout engine
     // assumes x=horizontal, y=vertical — so we swap coordinates to match.
-    let (mut items, rects, lines, coords_rotated) =
-        correct_rotated_page(items, rects, lines, &rotation_votes);
+    let (mut items, rects, lines, coords_rotated, item_glyphs) =
+        correct_rotated_page(items, rects, lines, &rotation_votes, item_glyphs);
     if coords_rotated {
         rotate_underline_graphics(&mut underline_rects, &mut underline_lines);
     }
@@ -1461,7 +1554,17 @@ pub(crate) fn extract_page_text_items(
         page_num,
     );
 
-    let items = super::merge_text_items(items);
+    // Phase 2: thread glyphs through merge_text_items_with_glyphs (the
+    // function Phase 3 will extend with bidi detection), then discard the
+    // glyph half — nothing downstream needs it yet. debug_assert since
+    // this must always hold by construction (every items.push above has a
+    // matching item_glyphs.push).
+    debug_assert_eq!(items.len(), item_glyphs.len());
+    let paired = items.into_iter().zip(item_glyphs).collect();
+    let items: Vec<TextItem> = super::merge_text_items_with_glyphs(paired)
+        .into_iter()
+        .map(|(it, _glyphs)| it)
+        .collect();
     let items = super::merge_subscript_items(items);
     Ok((
         (items, rects, lines),
@@ -1477,6 +1580,18 @@ struct RotationVotes {
     rotated: u32,
 }
 
+/// Return type of `correct_rotated_page`: items, rects, lines, whether the
+/// page was actually rotated, and the parallel per-item glyph vecs (Phase
+/// 2) — kept in lockstep with `items` throughout, transformed the same way
+/// when `coords_rotated` is true.
+type RotatedPageResult = (
+    Vec<TextItem>,
+    Vec<PdfRect>,
+    Vec<PdfLine>,
+    bool,
+    Vec<Vec<GlyphDecode>>,
+);
+
 /// Detect if most text items on a page are rotated 90° or 270°, and if so,
 /// swap x↔y coordinates (plus widths/heights) so the layout engine sees
 /// them as horizontal text on a landscape page.
@@ -1485,9 +1600,10 @@ fn correct_rotated_page(
     mut rects: Vec<PdfRect>,
     mut lines: Vec<PdfLine>,
     votes: &RotationVotes,
-) -> (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>, bool) {
+    mut item_glyphs: Vec<Vec<GlyphDecode>>,
+) -> RotatedPageResult {
     if items.len() < 2 {
-        return (items, rects, lines, false);
+        return (items, rects, lines, false, item_glyphs);
     }
 
     // Use the combined-matrix direction votes collected during extraction.
@@ -1496,7 +1612,7 @@ fn correct_rotated_page(
     let total_votes = votes.horizontal + votes.rotated;
     if total_votes == 0 || votes.rotated * 3 < total_votes * 2 {
         // Less than ~67% of text operators are rotated → not a rotated page
-        return (items, rects, lines, false);
+        return (items, rects, lines, false, item_glyphs);
     }
 
     log::debug!(
@@ -1547,7 +1663,20 @@ fn correct_rotated_page(
         line.y2 = new_y2;
     }
 
-    (items, rects, lines, true)
+    // Phase 2: keep glyph pen positions in the same coordinate space as
+    // the TextItems they belong to — same transform as the item x/y swap
+    // above, applied to every glyph's `pen`, so a rotated page's pen
+    // positions stay directly comparable to that page's (also-rotated)
+    // TextItem.x/.y for a future geometry pass.
+    for glyphs in &mut item_glyphs {
+        for g in glyphs.iter_mut() {
+            if let Some((x, y)) = g.pen {
+                g.pen = Some((y, -x));
+            }
+        }
+    }
+
+    (items, rects, lines, true, item_glyphs)
 }
 
 fn rotate_underline_graphics(rects: &mut [PdfRect], lines: &mut [UnderlineLine]) {
