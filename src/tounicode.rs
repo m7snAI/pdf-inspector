@@ -449,7 +449,32 @@ impl ToUnicodeCMap {
 
     /// Decode a byte slice to a Unicode string, respecting the CMap's code byte width
     pub fn decode_cids(&self, bytes: &[u8]) -> String {
-        let mut result = String::new();
+        // Defined in terms of decode_cids_glyphs so the two can never drift
+        // apart: this is exactly the old inline loop, just with the per-code
+        // step factored out so a caller that also needs per-glyph width can
+        // walk the same codes once instead of decoding twice.
+        let (units, failed) = self.decode_cids_glyphs(bytes);
+        if failed {
+            return String::new();
+        }
+        units.into_iter().filter_map(|(_, text)| text).collect()
+    }
+
+    /// Per-code decode: identical algorithm to `decode_cids`, but returns
+    /// each code's own `(code, Option<matched text>)` instead of collapsing
+    /// straight into one `String`. `code` is the CID for a 2-byte CMap or
+    /// the raw byte (widened to `u16`) for a 1-byte CMap — the same unit
+    /// `compute_string_width_ts`/`per_unit_glyph_widths` index widths by, so
+    /// a caller can zip this against a parallel width array positionally.
+    ///
+    /// The second return value mirrors `decode_cids`'s "too many codes
+    /// unmapped" failure signal (more than half the codes in the string):
+    /// when `true`, the whole string decode is a failure and `decode_cids`
+    /// returns `String::new()` — callers building glyphs from this method
+    /// directly must apply the same all-or-nothing rule rather than using
+    /// the partial `units` on their own.
+    pub(crate) fn decode_cids_glyphs(&self, bytes: &[u8]) -> (Vec<(u16, Option<String>)>, bool) {
+        let mut out = Vec::new();
         let mut unmapped_count = 0usize;
 
         if self.code_byte_length == 1 {
@@ -457,12 +482,14 @@ impl ToUnicodeCMap {
             for &b in bytes {
                 let code = b as u16;
                 match self.lookup(code) {
-                    Some(s) if !s.contains('\u{FFFD}') => result.push_str(&s),
+                    Some(s) if !s.contains('\u{FFFD}') => out.push((code, Some(s))),
                     _ => {
                         // For single-byte unmapped codes, try as Latin-1
                         // (the byte IS the character code in most legacy encodings)
                         if b >= 0x20 {
-                            result.push(b as char);
+                            out.push((code, Some((b as char).to_string())));
+                        } else {
+                            out.push((code, None));
                         }
                         unmapped_count += 1;
                     }
@@ -474,7 +501,7 @@ impl ToUnicodeCMap {
                 if chunk.len() == 2 {
                     let cid = u16::from_be_bytes([chunk[0], chunk[1]]);
                     match self.lookup(cid) {
-                        Some(s) if !s.contains('\u{FFFD}') => result.push_str(&s),
+                        Some(s) if !s.contains('\u{FFFD}') => out.push((cid, Some(s))),
                         _ => {
                             if self.cid_passthrough {
                                 // Last-resort: treat CID as Unicode codepoint.
@@ -482,16 +509,19 @@ impl ToUnicodeCMap {
                                 // used Unicode values as CIDs but stripped the cmap.
                                 if let Some(ch) = char::from_u32(cid as u32) {
                                     if !ch.is_control() || ch == '\t' || ch == '\n' {
-                                        result.push(ch);
+                                        out.push((cid, Some(ch.to_string())));
                                     } else {
+                                        out.push((cid, None));
                                         unmapped_count += 1;
                                     }
                                 } else {
+                                    out.push((cid, None));
                                     unmapped_count += 1;
                                 }
                             } else {
                                 // CIDs are font-internal indices, not Unicode values.
                                 // Unmapped 2-byte CIDs are skipped to avoid CJK garbage.
+                                out.push((cid, None));
                                 unmapped_count += 1;
                             }
                         }
@@ -500,18 +530,16 @@ impl ToUnicodeCMap {
             }
         }
 
-        // If too many codes were unmapped, signal failure by returning empty
-        // so the caller can fall through to other decoding methods
+        // If too many codes were unmapped, signal failure so the caller can
+        // fall through to other decoding methods (matches decode_cids).
         let total = if self.code_byte_length == 1 {
             bytes.len()
         } else {
             bytes.len() / 2
         };
-        if total > 0 && unmapped_count > total / 2 {
-            return String::new();
-        }
+        let failed = total > 0 && unmapped_count > total / 2;
 
-        result
+        (out, failed)
     }
 
     /// Get the minimum source CID across all mappings (char_map + ranges).

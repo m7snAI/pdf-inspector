@@ -647,19 +647,26 @@ fn assign_cid_width_range(
 /// `char_spacing` (Tc) is added per character and `word_spacing` (Tw) is added
 /// per space character (byte 0x20), both in unscaled text-space units.
 /// Per the PDF spec: tx = (w0 × Tfs + Tc + Tw_if_space) per glyph.
-pub(crate) fn compute_string_width_ts(
-    bytes: &[u8],
-    font_info: &FontWidthInfo,
-    font_size: f32,
-    char_spacing: f32,
-    word_spacing: f32,
-) -> f32 {
-    let mut total: f32 = 0.0;
-    let mut num_spaces: usize = 0;
-    let num_chars = if font_info.is_cid {
+/// One raw (unscaled, font-unit) glyph width, keyed by its CID (2-byte CMap)
+/// or raw byte code (1-byte/simple font) — the same unit
+/// `ToUnicodeCMap::decode_cids_glyphs` indexes its per-code decode by, so the
+/// two can be walked/zipped positionally. `is_space` marks code 32 (CID or
+/// byte), which is where Tw (word spacing) applies.
+pub(crate) struct RawGlyphWidth {
+    pub(crate) code: u16,
+    pub(crate) raw_width: f32,
+    pub(crate) is_space: bool,
+}
+
+/// Per-code raw glyph widths, in font units (not yet scaled to text space).
+/// This is `compute_string_width_ts`'s old inline loop, factored out so its
+/// per-code step can be shared with the combined decode/width walk — the
+/// loop over `bytes` now runs once for both concerns rather than twice.
+fn raw_glyph_widths(bytes: &[u8], font_info: &FontWidthInfo) -> Vec<RawGlyphWidth> {
+    let mut out = Vec::new();
+    if font_info.is_cid {
         // 2-byte (big-endian) character codes
         let mut j = 0;
-        let mut count = 0usize;
         while j + 1 < bytes.len() {
             let cid = u16::from_be_bytes([bytes[j], bytes[j + 1]]);
             let w = font_info
@@ -667,15 +674,13 @@ pub(crate) fn compute_string_width_ts(
                 .get(&cid)
                 .copied()
                 .unwrap_or(font_info.default_width);
-            total += w as f32;
-            // CID 32 = space in most CID fonts
-            if cid == 32 {
-                num_spaces += 1;
-            }
-            count += 1;
+            out.push(RawGlyphWidth {
+                code: cid,
+                raw_width: w as f32,
+                is_space: cid == 32, // CID 32 = space in most CID fonts
+            });
             j += 2;
         }
-        count
     } else {
         // 1-byte character codes
         for &b in bytes {
@@ -685,17 +690,48 @@ pub(crate) fn compute_string_width_ts(
                 .get(&code)
                 .copied()
                 .unwrap_or(font_info.default_width);
-            total += w as f32;
-            if b == 0x20 {
-                num_spaces += 1;
-            }
+            out.push(RawGlyphWidth {
+                code,
+                raw_width: w as f32,
+                is_space: b == 0x20,
+            });
         }
-        bytes.len()
-    };
-    // Convert from font units to text space using the font's scale factor
-    // Then add Tc per character and Tw per space character
+    }
+    out
+}
+
+/// Compute the width of a string in text space units,
+/// given raw bytes and font width info.
+/// Returns width in text space units (font_units * units_scale * font_size).
+///
+/// `char_spacing` (Tc) is added per character and `word_spacing` (Tw) is added
+/// per space character (byte 0x20), both in unscaled text-space units.
+/// Per the PDF spec: tx = (w0 × Tfs + Tc + Tw_if_space) per glyph.
+///
+/// Implemented on top of `raw_glyph_widths`, but preserves the *exact*
+/// original arithmetic order (sum raw per-code widths first, scale the sum
+/// once, add the Tc/Tw aggregates once) rather than distributing
+/// `units_scale * font_size`/Tc/Tw into each code and summing — those are
+/// two different (if mathematically equal) f32 evaluation orders, and only
+/// this one is guaranteed bit-identical to the pre-refactor implementation.
+pub(crate) fn compute_string_width_ts(
+    bytes: &[u8],
+    font_info: &FontWidthInfo,
+    font_size: f32,
+    char_spacing: f32,
+    word_spacing: f32,
+) -> f32 {
+    let widths = raw_glyph_widths(bytes, font_info);
+    let mut total: f32 = 0.0;
+    let mut num_spaces: usize = 0;
+    for w in &widths {
+        total += w.raw_width;
+        if w.is_space {
+            num_spaces += 1;
+        }
+    }
     total * font_info.units_scale * font_size
-        + num_chars as f32 * char_spacing
+        + widths.len() as f32 * char_spacing
         + num_spaces as f32 * word_spacing
 }
 
@@ -1153,6 +1189,514 @@ fn font_file_data(doc: &Document, ff_ref: ObjectId) -> Option<Vec<u8>> {
 
 /// Decode text from a PDF string operand using font CMaps, encodings, and fallbacks.
 #[allow(clippy::too_many_arguments)]
+/// One decoded glyph position within a Tj/TJ/quote-operator string operand:
+/// its own decoded text, its own text-space advance width, and the CID (or
+/// single byte, for a simple font) it came from.
+///
+/// `width_ts` is this glyph's own scaled advance
+/// (`raw_font_units * units_scale * font_size`) — it deliberately does NOT
+/// include the operand-level Tc/Tw (char/word spacing) terms
+/// `compute_string_width_ts` adds once for the whole operand. Distributing
+/// those per glyph and re-summing is not guaranteed bit-identical to that
+/// function's whole-operand formula (float addition/multiplication is not
+/// strictly associative/distributive over many terms), so Phase 1 keeps
+/// `compute_string_width_ts`'s aggregate as the sole source of truth for
+/// anything that affects text positioning (text_matrix advancement,
+/// `TextItem.width`). `width_ts` here is per-glyph descriptive data for
+/// later phases (e.g. pen-position tracking) — callers must not sum it to
+/// reconstruct that aggregate.
+///
+/// `cid` is `Some(code)` for a glyph produced by a direct CID/byte lookup
+/// (the normal case), and `None` for:
+///   - a "filler" glyph: the 2nd+ character of a ligature CID whose
+///     ToUnicode entry expands to multiple codepoints. `width_ts` is `0.0`
+///     for these — the CID's one real width lives on the first character
+///     only, mirroring MuPDF's own `fz_show_glyph_aux` filler-glyph
+///     convention for exactly this case (`pdf-op-run.c`'s `pdf_show_char`);
+///   - an "opaque" glyph from a decode path that isn't CID/byte-aligned
+///     (UTF-16/UTF-8 heuristic decode, lopdf's generic `decode_text`, the
+///     final single-byte catch-all, or the odd-length-CID `lookup_bytes`
+///     rescue path). One glyph then carries the *entire* operand's text and
+///     width, since there is no well-defined per-character split for these.
+#[derive(Debug, Clone)]
+pub(crate) struct GlyphDecode {
+    pub(crate) text: String,
+    pub(crate) width_ts: f32,
+    pub(crate) cid: Option<u16>,
+}
+
+/// Build glyphs from a code-aligned decode: `units` and `widths` must be the
+/// same length and positionally aligned (one entry each per CID/byte, in
+/// the same order they were walked) — the case for the primary/remapped/
+/// fallback CMap paths and the Differences-map path. A unit whose decode
+/// produced more than one character (a ligature CID) explodes into one real
+/// glyph (the unit's own width) plus zero-width filler glyphs for the rest.
+fn glyphs_from_aligned_units(
+    units: &[(u16, Option<String>)],
+    widths: &[RawGlyphWidth],
+    units_scale: f32,
+    font_size: f32,
+) -> Vec<GlyphDecode> {
+    let mut out = Vec::with_capacity(units.len());
+    for (i, (code, text)) in units.iter().enumerate() {
+        let w = widths
+            .get(i)
+            .map(|rw| rw.raw_width * units_scale * font_size)
+            .unwrap_or(0.0);
+        let mut chars = text.as_deref().unwrap_or("").chars();
+        match chars.next() {
+            Some(first) => {
+                out.push(GlyphDecode {
+                    text: first.to_string(),
+                    width_ts: w,
+                    cid: Some(*code),
+                });
+                for extra in chars {
+                    out.push(GlyphDecode {
+                        text: extra.to_string(),
+                        width_ts: 0.0,
+                        cid: None,
+                    });
+                }
+            }
+            None => out.push(GlyphDecode {
+                text: String::new(),
+                width_ts: w,
+                cid: Some(*code),
+            }),
+        }
+    }
+    out
+}
+
+/// Build a single "opaque" glyph spanning a whole operand, for decode paths
+/// that aren't CID/byte-aligned with `widths` (see `GlyphDecode` docs).
+fn opaque_glyph(text: String, widths: &[RawGlyphWidth], units_scale: f32, font_size: f32) -> Vec<GlyphDecode> {
+    let raw_total: f32 = widths.iter().map(|w| w.raw_width).sum();
+    vec![GlyphDecode {
+        text,
+        width_ts: raw_total * units_scale * font_size,
+        cid: None,
+    }]
+}
+
+fn units_to_string(units: &[(u16, Option<String>)]) -> String {
+    units.iter().filter_map(|(_, t)| t.clone()).collect()
+}
+
+/// Combined decode: walks the operand's CIDs/bytes once, producing both the
+/// decoded text (identical to the old, separate `extract_text_from_operand`)
+/// and a per-glyph breakdown with widths (see `GlyphDecode`). This is the
+/// real implementation — `extract_text_from_operand` is now a thin wrapper
+/// over it (text decode never depends on font_size/char_spacing/
+/// word_spacing, so it can call this with placeholder values for those and
+/// discard the glyph half).
+///
+/// The full decode chain (primary/fallback/remapped CMap selection, the
+/// memoized `cmap_decisions` choice, the score-based fallback-preference
+/// swap, the CID-unmapped placeholder, Differences map, UTF-16/UTF-8/lopdf/
+/// symbol fallbacks, and the final single-byte catch-all) is preserved
+/// exactly, in the same order, with the same conditions — see
+/// `extract_text_from_operand`'s original doc comment history / the Phase 1
+/// research notes for the branch-by-branch trace this mirrors.
+pub(crate) fn decode_operand_glyphs(
+    obj: &Object,
+    current_font: &str,
+    base_font_name: Option<&str>,
+    font_cmaps: &FontCMaps,
+    font_tounicode_refs: &std::collections::HashMap<String, u32>,
+    inline_cmaps: &std::collections::HashMap<String, crate::tounicode::CMapEntry>,
+    font_encodings: &PageFontEncodings,
+    encoding_cache: &HashMap<String, Encoding<'_>>,
+    cmap_decisions: &mut CMapDecisionCache,
+    font_widths: &PageFontWidths,
+    font_size: f32,
+    char_spacing: f32,
+    word_spacing: f32,
+) -> (Option<String>, Vec<GlyphDecode>) {
+    let font_info = font_widths.get(current_font);
+    let is_type0_cid_font = font_info.is_some_and(|info| info.is_cid);
+    let use_cp1252_fallback =
+        should_use_cp1252_single_byte_fallback(base_font_name, is_type0_cid_font);
+
+    let Object::String(bytes, _) = obj else {
+        return (None, Vec::new());
+    };
+
+    // Per-code raw widths, walked once, up front — independent of which
+    // text-decode branch below ends up winning (compute_string_width_ts
+    // never looked at decoded text either). char_spacing/word_spacing are
+    // NOT part of this array; see GlyphDecode's doc comment.
+    let widths: Vec<RawGlyphWidth> = font_info
+        .map(|fi| raw_glyph_widths(bytes, fi))
+        .unwrap_or_default();
+    let units_scale = font_info.map(|fi| fi.units_scale).unwrap_or(1.0);
+    // Guarded, not just aligned-by-construction: `widths` is always indexed
+    // the way `raw_glyph_widths`/`compute_string_width_ts` walk `bytes`
+    // (CID pairs for an is_cid font, single bytes otherwise), but a few
+    // fallback decode branches below are byte-indexed regardless of
+    // is_cid (Differences map, the final single-byte catch-all) and can be
+    // reached even for a CID font (e.g. one with no usable CMap at all but
+    // an all-ASCII operand). A length mismatch there would silently
+    // mis-pair units with the wrong widths — fall back to one opaque glyph
+    // instead, exactly like the branches that are unaligned by design.
+    let glyphs_for = |units: &[(u16, Option<String>)]| -> Vec<GlyphDecode> {
+        if units.len() == widths.len() {
+            glyphs_from_aligned_units(units, &widths, units_scale, font_size)
+        } else {
+            opaque_glyph(units_to_string(units), &widths, units_scale, font_size)
+        }
+    };
+    let opaque_for =
+        |text: String| -> Vec<GlyphDecode> { opaque_glyph(text, &widths, units_scale, font_size) };
+    // Silence unused-parameter warnings on the placeholder-call path used by
+    // extract_text_from_operand's wrapper (char_spacing/word_spacing are
+    // intentionally not consumed here — see GlyphDecode's doc comment).
+    let _ = (char_spacing, word_spacing);
+
+    #[allow(clippy::type_complexity)]
+    let mut decode_with_entry =
+        |entry: &crate::tounicode::CMapEntry| -> Option<(String, Vec<GlyphDecode>)> {
+            // For single-byte CMaps, merge CMap + Differences at the byte level:
+            // try CMap first, then Differences, then Latin-1 fallback per byte.
+            // This prevents partial CMap results from blocking the Differences path.
+            if entry.primary.code_byte_length == 1 {
+                let encoding_map = font_encodings.get(current_font);
+                let mut units: Vec<(u16, Option<String>)> = Vec::with_capacity(bytes.len());
+                for &b in bytes.iter() {
+                    let code = b as u16;
+                    let text: Option<String> = (|| {
+                        // 1. Primary CMap
+                        if let Some(s) = entry.primary.lookup(code) {
+                            if !s.contains('\u{FFFD}') {
+                                return Some(s);
+                            }
+                        }
+                        // 2. Fallback CMap (embedded font cmap)
+                        if let Some(fb) = entry.fallback.as_ref().and_then(|c| c.lookup(code)) {
+                            if !fb.contains('\u{FFFD}') {
+                                return Some(fb);
+                            }
+                        }
+                        // 3. Differences mapped it? Use Differences result
+                        if let Some(map) = encoding_map {
+                            if let Some(&ch) = map.get(&b) {
+                                return Some(ch.to_string());
+                            }
+                        }
+                        // 4. Printable single-byte fallback
+                        if b >= 0x20 {
+                            return Some(
+                                decode_single_byte_fallback_char(b, use_cp1252_fallback)
+                                    .to_string(),
+                            );
+                        }
+                        None
+                    })();
+                    units.push((code, text));
+                }
+                let decoded = units_to_string(&units);
+                if !decoded.is_empty() {
+                    return Some((decoded, glyphs_for(&units)));
+                }
+                return None;
+            }
+
+            // 2-byte CMap: use standard decode_cids path
+            if bytes.len() % 2 == 1 {
+                // Some PDFs emit 1-byte codes even for Type0 fonts; try per-byte lookup
+                let lookups = entry.primary.lookup_bytes(bytes);
+                let decoded: String = lookups
+                    .iter()
+                    .filter_map(|&(_b, ref cmap_result)| cmap_result.clone())
+                    .collect();
+                if !decoded.is_empty() {
+                    // Byte-indexed (up to bytes.len() units), not aligned with
+                    // `widths` (CID-indexed, floor(bytes.len()/2) units) —
+                    // opaque, see GlyphDecode docs.
+                    return Some((decoded.clone(), opaque_for(decoded)));
+                }
+            }
+            let (primary_units, primary_failed) = entry.primary.decode_cids_glyphs(bytes);
+            let decoded_primary = if primary_failed {
+                String::new()
+            } else {
+                units_to_string(&primary_units)
+            };
+            if let Some(remapped) = entry.remapped.as_ref() {
+                let (remap_units, remap_failed) = remapped.decode_cids_glyphs(bytes);
+                let decoded_remap = if remap_failed {
+                    String::new()
+                } else {
+                    units_to_string(&remap_units)
+                };
+                let fallback_pair = entry.fallback.as_ref().map(|c| c.decode_cids_glyphs(bytes));
+                let decoded_fallback: Option<String> = fallback_pair.as_ref().map(|(u, failed)| {
+                    if *failed {
+                        String::new()
+                    } else {
+                        units_to_string(u)
+                    }
+                });
+
+                if let Some(choice) = cmap_decisions
+                    .get_choice(font_tounicode_refs.get(current_font).copied().unwrap_or(0))
+                {
+                    let (decoded, units) = match choice {
+                        CMapChoice::Primary => (decoded_primary.clone(), &primary_units),
+                        CMapChoice::Remapped => (decoded_remap.clone(), &remap_units),
+                    };
+                    if !decoded.is_empty() {
+                        return Some((decoded, glyphs_for(units)));
+                    }
+                }
+
+                let choice = cmap_decisions.consider(
+                    font_tounicode_refs.get(current_font).copied().unwrap_or(0),
+                    &decoded_primary,
+                    &decoded_remap,
+                    bytes.len(),
+                );
+                let (mut decoded, mut units) = match choice {
+                    Some(CMapChoice::Primary) => (decoded_primary, primary_units),
+                    Some(CMapChoice::Remapped) => (decoded_remap, remap_units),
+                    // Mirrors choose_best_cmap_decode's exact branches (not
+                    // called directly — it consumes/returns Strings and
+                    // doesn't say which side won, which we also need here
+                    // to pick the matching units vec).
+                    None => {
+                        if decoded_primary.is_empty() {
+                            (decoded_remap, remap_units)
+                        } else if decoded_remap.is_empty() {
+                            (decoded_primary, primary_units)
+                        } else if score_text(&decoded_remap) > score_text(&decoded_primary) + 3 {
+                            (decoded_remap, remap_units)
+                        } else {
+                            (decoded_primary, primary_units)
+                        }
+                    }
+                };
+                if let Some(fb) = decoded_fallback {
+                    let expected = bytes.len() / 2;
+                    let decoded_len = decoded.chars().count();
+                    let prefer_fallback = (!fb.is_empty() && decoded.is_empty())
+                        || (!fb.is_empty() && expected > 0 && decoded_len * 2 < expected);
+                    if prefer_fallback || score_text(&fb) > score_text(&decoded) + 3 {
+                        decoded = fb;
+                        units = fallback_pair.map(|(u, _)| u).unwrap_or_default();
+                    }
+                }
+                if !decoded.is_empty() {
+                    return Some((decoded, glyphs_for(&units)));
+                }
+            } else if !decoded_primary.is_empty() {
+                let mut decoded = decoded_primary.clone();
+                let mut units = primary_units;
+                if let Some((fb_units, fb_failed)) =
+                    entry.fallback.as_ref().map(|c| c.decode_cids_glyphs(bytes))
+                {
+                    let fb = if fb_failed {
+                        String::new()
+                    } else {
+                        units_to_string(&fb_units)
+                    };
+                    let expected = bytes.len() / 2;
+                    let decoded_len = decoded_primary.chars().count();
+                    let prefer_fallback = (!fb.is_empty() && decoded_primary.is_empty())
+                        || (!fb.is_empty() && expected > 0 && decoded_len * 2 < expected);
+                    if prefer_fallback || score_text(&fb) > score_text(&decoded_primary) + 3 {
+                        decoded = fb;
+                        units = fb_units;
+                    }
+                }
+                if !decoded.is_empty() {
+                    return Some((decoded, glyphs_for(&units)));
+                }
+            }
+
+            None
+        };
+
+    let (result_text, result_glyphs) = (|| -> (Option<String>, Vec<GlyphDecode>) {
+        let mut has_cmap = false;
+        if let Some(entry) = inline_cmaps.get(current_font) {
+            has_cmap = true;
+            if let Some((decoded, glyphs)) = decode_with_entry(entry) {
+                return (Some(decoded), glyphs);
+            }
+        }
+
+        // Look up CMap by ToUnicode object reference
+        if let Some(&obj_num) = font_tounicode_refs.get(current_font) {
+            if let Some(entry) = font_cmaps.get_by_obj(obj_num) {
+                has_cmap = true;
+                if let Some((decoded, glyphs)) = decode_with_entry(entry) {
+                    return (Some(decoded), glyphs);
+                }
+            }
+        }
+
+        // CID fonts with a CMap that couldn't decode: the CID is genuinely
+        // unmapped. Don't fall through to text-interpretation fallbacks
+        // (Latin-1, UTF-16, etc.) which would misinterpret CID bytes as
+        // character codes (e.g. CID 0x01A9 → Latin-1 "©").
+        if is_type0_cid_font && bytes.iter().any(|&b| b > 0x7F) {
+            // 2-byte CIDs (Identity-H) are by far the common case; for
+            // an odd byte count we still emit at least one marker so
+            // detection downstream fires.
+            let cid_count = (bytes.len() / 2).max(1);
+            let text = "\u{FFFD}".repeat(cid_count);
+            // Aligned only when every placeholder has a real CID pair behind
+            // it (widths has exactly cid_count entries); the `.max(1)` pad
+            // for <2-byte input has no such pair — opaque in that case.
+            if widths.len() == cid_count {
+                let units: Vec<(u16, Option<String>)> = widths
+                    .iter()
+                    .map(|w| (w.code, Some("\u{FFFD}".to_string())))
+                    .collect();
+                return (Some(text), glyphs_for(&units));
+            }
+            return (Some(text.clone()), opaque_for(text));
+        }
+
+        // Try our custom encoding map from Differences arrays.
+        // The Differences array overrides specific codes in a base encoding (typically
+        // WinAnsiEncoding). We must combine Differences entries with the base encoding
+        // rather than using filter_map which silently drops unmapped bytes.
+        if let Some(encoding_map) = font_encodings.get(current_font) {
+            let has_diff_match = bytes.iter().any(|b| encoding_map.contains_key(b));
+            if has_diff_match {
+                let units: Vec<(u16, Option<String>)> = bytes
+                    .iter()
+                    .map(|&b| {
+                        let text = if let Some(&ch) = encoding_map.get(&b) {
+                            Some(ch.to_string())
+                        } else if b >= 0x20 {
+                            // Base encoding fallback for printable bytes.
+                            // Most PDFs with simple fonts use WinAnsi/PDFDocEncoding
+                            // semantics, not ISO-8859-1 C1 controls.
+                            Some(decode_single_byte_fallback_char(b, use_cp1252_fallback).to_string())
+                        } else {
+                            None // Skip unmapped control characters
+                        };
+                        (b as u16, text)
+                    })
+                    .collect();
+                let decoded = units_to_string(&units);
+                if !decoded.is_empty() {
+                    return (Some(decoded), glyphs_for(&units));
+                }
+            }
+        }
+
+        // Fallback: try UTF-16BE then Latin-1
+        if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+            let utf16: Vec<u16> = bytes[2..]
+                .chunks_exact(2)
+                .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+                .collect();
+            let text = String::from_utf16_lossy(&utf16);
+            if text.contains('\u{FFFD}') {
+                debug!(
+                    "utf16 loss produced replacement for font={} bytes_len={}",
+                    current_font,
+                    bytes.len()
+                );
+            }
+            return (Some(text.clone()), opaque_for(text));
+        }
+
+        // Heuristic UTF-16BE decode when bytes look like UTF-16 (even length, null-heavy)
+        if bytes.len() >= 4 && bytes.len() % 2 == 0 {
+            let nulls = bytes.iter().filter(|&&b| b == 0).count();
+            if nulls * 4 > bytes.len() {
+                let utf16: Vec<u16> = bytes
+                    .chunks_exact(2)
+                    .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+                    .collect();
+                let text = String::from_utf16_lossy(&utf16);
+                if score_text(&text) > 0 {
+                    return (Some(text.clone()), opaque_for(text));
+                }
+            }
+        }
+
+        // Check for UTF-8 encoded strings before single-byte encoding decoding.
+        // Some PDFs incorrectly embed UTF-8 bytes in single-byte encoded fonts
+        // (e.g. "José" as UTF-8 [C3 A9] instead of WinAnsi [E9]).
+        if bytes.iter().any(|&b| b > 0x7F) {
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                let text = text.to_string();
+                return (Some(text.clone()), opaque_for(text));
+            }
+        }
+
+        // Try to decode using cached font encoding from lopdf
+        if let Some(encoding) = encoding_cache.get(current_font) {
+            if let Ok(text) = Document::decode_text(encoding, bytes) {
+                let text = normalize_cp1252_controls(text, use_cp1252_fallback);
+                if text.contains('\u{FFFD}') {
+                    debug!(
+                        "decode_text produced replacement for font={} bytes_len={}",
+                        current_font,
+                        bytes.len()
+                    );
+                    if bytes.len() <= 8 {
+                        let hex: String = bytes.iter().map(|b| format!("{:02X}", b)).collect();
+                        debug!(
+                            "decode_text replacement bytes font={} base={:?} hex={}",
+                            current_font, base_font_name, hex
+                        );
+                    }
+                    if bytes.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
+                        let text: String = bytes.iter().map(|&b| b as char).collect();
+                        return (Some(text.clone()), opaque_for(text));
+                    }
+                    if let Some(symbol_text) = decode_symbol_fallback(bytes, base_font_name) {
+                        return (Some(symbol_text.clone()), opaque_for(symbol_text));
+                    }
+                    // For CID fonts (have ToUnicode CMap), the CID is
+                    // genuinely unmapped — return None to avoid Latin-1
+                    // fallback misinterpreting CID bytes as characters.
+                    if has_cmap || font_tounicode_refs.contains_key(current_font) {
+                        return (None, Vec::new());
+                    }
+                    // Non-CID fonts: fall through to other methods
+                } else {
+                    return (Some(text.clone()), opaque_for(text));
+                }
+            }
+        }
+
+        if let Some(symbol_text) = decode_symbol_fallback(bytes, base_font_name) {
+            return (Some(symbol_text.clone()), opaque_for(symbol_text));
+        }
+
+        // Non-CID (Type1 / TrueType / Type3) fonts use single-byte
+        // encodings. In practice the fallback should follow WinAnsi for
+        // 0x80..=0x9F so bytes like 0x92 become smart punctuation instead
+        // of C1 controls that look like CID mojibake.
+        let units: Vec<(u16, Option<String>)> = bytes
+            .iter()
+            .map(|&b| {
+                (
+                    b as u16,
+                    Some(decode_single_byte_fallback_char(b, use_cp1252_fallback).to_string()),
+                )
+            })
+            .collect();
+        let decoded = units_to_string(&units);
+        (Some(decoded), glyphs_for(&units))
+    })();
+
+    let text = result_text.map(|text| {
+        let text = clean_symbol_pua(text);
+        let text = remap_texcm_math_symbols(text, base_font_name);
+        normalize_cp1252_controls(text, use_cp1252_fallback)
+    });
+    (text, result_glyphs)
+}
+
 pub(crate) fn extract_text_from_operand(
     obj: &Object,
     current_font: &str,
@@ -1165,278 +1709,27 @@ pub(crate) fn extract_text_from_operand(
     cmap_decisions: &mut CMapDecisionCache,
     font_widths: &PageFontWidths,
 ) -> Option<String> {
-    let is_type0_cid_font = font_widths
-        .get(current_font)
-        .is_some_and(|info| info.is_cid);
-    let use_cp1252_fallback =
-        should_use_cp1252_single_byte_fallback(base_font_name, is_type0_cid_font);
-    let result = (|| -> Option<String> {
-        if let Object::String(bytes, _) = obj {
-            let mut decode_with_entry = |entry: &crate::tounicode::CMapEntry| -> Option<String> {
-                // For single-byte CMaps, merge CMap + Differences at the byte level:
-                // try CMap first, then Differences, then Latin-1 fallback per byte.
-                // This prevents partial CMap results from blocking the Differences path.
-                if entry.primary.code_byte_length == 1 {
-                    let encoding_map = font_encodings.get(current_font);
-                    let decoded: String = bytes
-                        .iter()
-                        .filter_map(|&b| {
-                            let code = b as u16;
-                            // 1. Primary CMap
-                            if let Some(s) = entry.primary.lookup(code) {
-                                if !s.contains('\u{FFFD}') {
-                                    return Some(s);
-                                }
-                            }
-                            // 2. Fallback CMap (embedded font cmap)
-                            if let Some(fb) = entry.fallback.as_ref().and_then(|c| c.lookup(code)) {
-                                if !fb.contains('\u{FFFD}') {
-                                    return Some(fb);
-                                }
-                            }
-                            // 3. Differences mapped it? Use Differences result
-                            if let Some(map) = encoding_map {
-                                if let Some(&ch) = map.get(&b) {
-                                    return Some(ch.to_string());
-                                }
-                            }
-                            // 4. Printable single-byte fallback
-                            if b >= 0x20 {
-                                return Some(
-                                    decode_single_byte_fallback_char(b, use_cp1252_fallback)
-                                        .to_string(),
-                                );
-                            }
-                            None
-                        })
-                        .collect();
-                    if !decoded.is_empty() {
-                        return Some(decoded);
-                    }
-                    return None;
-                }
-
-                // 2-byte CMap: use standard decode_cids path
-                if bytes.len() % 2 == 1 {
-                    // Some PDFs emit 1-byte codes even for Type0 fonts; try per-byte lookup
-                    let lookups = entry.primary.lookup_bytes(bytes);
-                    let decoded: String = lookups
-                        .iter()
-                        .filter_map(|&(_b, ref cmap_result)| cmap_result.clone())
-                        .collect();
-                    if !decoded.is_empty() {
-                        return Some(decoded);
-                    }
-                }
-                let decoded_primary = entry.primary.decode_cids(bytes);
-                if let Some(remapped) = entry.remapped.as_ref() {
-                    let decoded_remap = remapped.decode_cids(bytes);
-                    let decoded_fallback = entry.fallback.as_ref().map(|c| c.decode_cids(bytes));
-
-                    if let Some(choice) = cmap_decisions
-                        .get_choice(font_tounicode_refs.get(current_font).copied().unwrap_or(0))
-                    {
-                        let decoded = match choice {
-                            CMapChoice::Primary => decoded_primary.clone(),
-                            CMapChoice::Remapped => decoded_remap.clone(),
-                        };
-                        if !decoded.is_empty() {
-                            return Some(decoded);
-                        }
-                    }
-
-                    let choice = cmap_decisions.consider(
-                        font_tounicode_refs.get(current_font).copied().unwrap_or(0),
-                        &decoded_primary,
-                        &decoded_remap,
-                        bytes.len(),
-                    );
-                    let mut decoded = match choice {
-                        Some(CMapChoice::Primary) => decoded_primary,
-                        Some(CMapChoice::Remapped) => decoded_remap,
-                        None => choose_best_cmap_decode(decoded_primary, decoded_remap),
-                    };
-                    if let Some(fb) = decoded_fallback {
-                        let expected = bytes.len() / 2;
-                        let decoded_len = decoded.chars().count();
-                        let prefer_fallback = (!fb.is_empty() && decoded.is_empty())
-                            || (!fb.is_empty() && expected > 0 && decoded_len * 2 < expected);
-                        if prefer_fallback || score_text(&fb) > score_text(&decoded) + 3 {
-                            decoded = fb;
-                        }
-                    }
-                    if !decoded.is_empty() {
-                        return Some(decoded);
-                    }
-                } else if !decoded_primary.is_empty() {
-                    if let Some(fb) = entry.fallback.as_ref().map(|c| c.decode_cids(bytes)) {
-                        let expected = bytes.len() / 2;
-                        let decoded_len = decoded_primary.chars().count();
-                        let prefer_fallback = (!fb.is_empty() && decoded_primary.is_empty())
-                            || (!fb.is_empty() && expected > 0 && decoded_len * 2 < expected);
-                        if prefer_fallback || score_text(&fb) > score_text(&decoded_primary) + 3 {
-                            return Some(fb);
-                        }
-                    }
-                    return Some(decoded_primary);
-                }
-
-                None
-            };
-
-            let mut has_cmap = false;
-            if let Some(entry) = inline_cmaps.get(current_font) {
-                has_cmap = true;
-                if let Some(decoded) = decode_with_entry(entry) {
-                    return Some(decoded);
-                }
-            }
-
-            // Look up CMap by ToUnicode object reference
-            if let Some(&obj_num) = font_tounicode_refs.get(current_font) {
-                if let Some(entry) = font_cmaps.get_by_obj(obj_num) {
-                    has_cmap = true;
-                    if let Some(decoded) = decode_with_entry(entry) {
-                        return Some(decoded);
-                    }
-                }
-            }
-
-            // CID fonts with a CMap that couldn't decode: the CID is genuinely
-            // unmapped. Don't fall through to text-interpretation fallbacks
-            // (Latin-1, UTF-16, etc.) which would misinterpret CID bytes as
-            // character codes (e.g. CID 0x01A9 → Latin-1 "©").
-            if is_type0_cid_font && bytes.iter().any(|&b| b > 0x7F) {
-                // 2-byte CIDs (Identity-H) are by far the common case; for
-                // an odd byte count we still emit at least one marker so
-                // detection downstream fires.
-                let cid_count = (bytes.len() / 2).max(1);
-                return Some("\u{FFFD}".repeat(cid_count));
-            }
-
-            // Try our custom encoding map from Differences arrays.
-            // The Differences array overrides specific codes in a base encoding (typically
-            // WinAnsiEncoding). We must combine Differences entries with the base encoding
-            // rather than using filter_map which silently drops unmapped bytes.
-            if let Some(encoding_map) = font_encodings.get(current_font) {
-                let has_diff_match = bytes.iter().any(|b| encoding_map.contains_key(b));
-                if has_diff_match {
-                    let decoded: String = bytes
-                        .iter()
-                        .filter_map(|&b| {
-                            if let Some(&ch) = encoding_map.get(&b) {
-                                Some(ch)
-                            } else if b >= 0x20 {
-                                // Base encoding fallback for printable bytes.
-                                // Most PDFs with simple fonts use WinAnsi/PDFDocEncoding
-                                // semantics, not ISO-8859-1 C1 controls.
-                                Some(decode_single_byte_fallback_char(b, use_cp1252_fallback))
-                            } else {
-                                None // Skip unmapped control characters
-                            }
-                        })
-                        .collect();
-                    if !decoded.is_empty() {
-                        return Some(decoded);
-                    }
-                }
-            }
-
-            // Fallback: try UTF-16BE then Latin-1
-            if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
-                let utf16: Vec<u16> = bytes[2..]
-                    .chunks_exact(2)
-                    .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-                    .collect();
-                let text = String::from_utf16_lossy(&utf16);
-                if text.contains('\u{FFFD}') {
-                    debug!(
-                        "utf16 loss produced replacement for font={} bytes_len={}",
-                        current_font,
-                        bytes.len()
-                    );
-                }
-                return Some(text);
-            }
-
-            // Heuristic UTF-16BE decode when bytes look like UTF-16 (even length, null-heavy)
-            if bytes.len() >= 4 && bytes.len() % 2 == 0 {
-                let nulls = bytes.iter().filter(|&&b| b == 0).count();
-                if nulls * 4 > bytes.len() {
-                    let utf16: Vec<u16> = bytes
-                        .chunks_exact(2)
-                        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-                        .collect();
-                    let text = String::from_utf16_lossy(&utf16);
-                    if score_text(&text) > 0 {
-                        return Some(text);
-                    }
-                }
-            }
-
-            // Check for UTF-8 encoded strings before single-byte encoding decoding.
-            // Some PDFs incorrectly embed UTF-8 bytes in single-byte encoded fonts
-            // (e.g. "José" as UTF-8 [C3 A9] instead of WinAnsi [E9]).
-            if bytes.iter().any(|&b| b > 0x7F) {
-                if let Ok(text) = std::str::from_utf8(bytes) {
-                    return Some(text.to_string());
-                }
-            }
-
-            // Try to decode using cached font encoding from lopdf
-            if let Some(encoding) = encoding_cache.get(current_font) {
-                if let Ok(text) = Document::decode_text(encoding, bytes) {
-                    let text = normalize_cp1252_controls(text, use_cp1252_fallback);
-                    if text.contains('\u{FFFD}') {
-                        debug!(
-                            "decode_text produced replacement for font={} bytes_len={}",
-                            current_font,
-                            bytes.len()
-                        );
-                        if bytes.len() <= 8 {
-                            let hex: String = bytes.iter().map(|b| format!("{:02X}", b)).collect();
-                            debug!(
-                                "decode_text replacement bytes font={} base={:?} hex={}",
-                                current_font, base_font_name, hex
-                            );
-                        }
-                        if bytes.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
-                            return Some(bytes.iter().map(|&b| b as char).collect());
-                        }
-                        if let Some(symbol_text) = decode_symbol_fallback(bytes, base_font_name) {
-                            return Some(symbol_text);
-                        }
-                        // For CID fonts (have ToUnicode CMap), the CID is
-                        // genuinely unmapped — return None to avoid Latin-1
-                        // fallback misinterpreting CID bytes as characters.
-                        if has_cmap || font_tounicode_refs.contains_key(current_font) {
-                            return None;
-                        }
-                        // Non-CID fonts: fall through to other methods
-                    } else {
-                        return Some(text);
-                    }
-                }
-            }
-
-            if let Some(symbol_text) = decode_symbol_fallback(bytes, base_font_name) {
-                return Some(symbol_text);
-            }
-
-            // Non-CID (Type1 / TrueType / Type3) fonts use single-byte
-            // encodings. In practice the fallback should follow WinAnsi for
-            // 0x80..=0x9F so bytes like 0x92 become smart punctuation instead
-            // of C1 controls that look like CID mojibake.
-            Some(decode_single_byte_fallback(bytes, use_cp1252_fallback))
-        } else {
-            None
-        }
-    })();
-    result.map(|text| {
-        let text = clean_symbol_pua(text);
-        let text = remap_texcm_math_symbols(text, base_font_name);
-        normalize_cp1252_controls(text, use_cp1252_fallback)
-    })
+    // Text decode never depends on font_size/char_spacing/word_spacing (only
+    // GlyphDecode.width_ts does — see its doc comment), so any placeholder
+    // values here are safe: this is byte-for-byte the same decode as before,
+    // just reached through the unified function instead of a duplicate copy
+    // of the same ~280 lines.
+    decode_operand_glyphs(
+        obj,
+        current_font,
+        base_font_name,
+        font_cmaps,
+        font_tounicode_refs,
+        inline_cmaps,
+        font_encodings,
+        encoding_cache,
+        cmap_decisions,
+        font_widths,
+        1.0,
+        0.0,
+        0.0,
+    )
+    .0
 }
 
 /// Fix a known producer bug in "TeXCMMathsSymbols" subset fonts (IntechOpen
@@ -1465,6 +1758,11 @@ fn remap_texcm_math_symbols(text: String, base_font_name: Option<&str>) -> Strin
         .collect()
 }
 
+// decode_operand_glyphs's final catch-all now builds the equivalent
+// per-byte units inline (to also produce GlyphDecode output), so this is no
+// longer called directly; kept as the single-byte-fallback primitive name
+// in case a future caller wants just the string.
+#[allow(dead_code)]
 fn decode_single_byte_fallback(bytes: &[u8], use_cp1252_fallback: bool) -> String {
     bytes
         .iter()
@@ -1612,6 +1910,11 @@ fn decode_symbol_fallback(bytes: &[u8], base_font_name: Option<&str>) -> Option<
     }
 }
 
+// No longer called directly (decode_operand_glyphs inlines the same
+// branches so it can also track which side — primary or remapped — won,
+// needed to pick the matching per-glyph units vec); kept for its unit test
+// coverage of the tie-break logic in isolation.
+#[allow(dead_code)]
 fn choose_best_cmap_decode(primary: String, remapped: String) -> String {
     if primary.is_empty() {
         return remapped;
@@ -2038,6 +2341,91 @@ mod tests {
         let w = compute_string_width_ts(bytes, &fi, 12.0, 0.2, 0.3);
         // glyph: (500+250)*0.001*12 = 9.0, Tc: 2*0.2 = 0.4, Tw: 1*0.3 = 0.3
         assert!((w - 9.7).abs() < 0.01);
+    }
+
+    #[test]
+    fn ligature_cid_produces_first_real_glyph_plus_zero_width_filler() {
+        // Real Lam-Alef ligature CID from the Aspose-produced Etimad tender
+        // corpus (نموذج_كراسة_عام.pdf, font /F1, BCDEEE+DINNextLTArabic-
+        // Regular, found tracing the Instance 2 investigation): CID 0x01D9
+        // -> "لا" (U+0644 LAM, U+0627 ALEF), font-unit width 680.
+        //
+        // Confirms decode_operand_glyphs's ligature split (Phase 1 design
+        // point 2): one real glyph carrying the CID's own width for the
+        // first character, one zero-width filler (cid=None) for the second
+        // — mirroring MuPDF's fz_show_glyph_aux filler-glyph convention for
+        // exactly this case — while the aggregate width from
+        // compute_string_width_ts (untouched) stays exactly what it was
+        // before Phase 1.
+        let cmap_content = br#"
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+1 beginbfrange
+<01D9> <01D9> [<06440627>]
+endbfrange
+"#;
+        let cmap = crate::tounicode::ToUnicodeCMap::parse(cmap_content).unwrap();
+        assert_eq!(cmap.code_byte_length, 2);
+        assert_eq!(cmap.lookup(0x01D9), Some("لا".to_string()));
+
+        let entry = crate::tounicode::CMapEntry {
+            primary: cmap,
+            remapped: None,
+            fallback: None,
+        };
+        let mut inline_cmaps = HashMap::new();
+        inline_cmaps.insert("F1".to_string(), entry);
+
+        let mut font_widths: PageFontWidths = HashMap::new();
+        font_widths.insert("F1".to_string(), make_font_info(&[(0x01D9, 680)], 1000, true));
+
+        let bytes = vec![0x01u8, 0xD9]; // CID 0x01D9, big-endian
+        let obj = Object::String(bytes.clone(), lopdf::StringFormat::Hexadecimal);
+
+        let font_cmaps = FontCMaps::default();
+        let font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        let font_encodings: PageFontEncodings = HashMap::new();
+        let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
+        let mut decisions = CMapDecisionCache::new();
+
+        let (text, glyphs) = decode_operand_glyphs(
+            &obj,
+            "F1",
+            None,
+            &font_cmaps,
+            &font_tounicode_refs,
+            &inline_cmaps,
+            &font_encodings,
+            &encoding_cache,
+            &mut decisions,
+            &font_widths,
+            12.0,
+            0.0,
+            0.0,
+        );
+
+        assert_eq!(text.as_deref(), Some("لا"));
+        assert_eq!(glyphs.len(), 2, "one real + one filler glyph, not one per string");
+
+        assert_eq!(glyphs[0].text, "ل");
+        assert_eq!(glyphs[0].cid, Some(0x01D9));
+        let expected_width = 680.0 * 0.001 * 12.0; // raw_width * units_scale * font_size
+        assert!(
+            (glyphs[0].width_ts - expected_width).abs() < 0.001,
+            "first glyph should carry the CID's real width, got {}",
+            glyphs[0].width_ts
+        );
+
+        assert_eq!(glyphs[1].text, "ا");
+        assert_eq!(glyphs[1].cid, None, "filler glyph has no CID of its own");
+        assert_eq!(glyphs[1].width_ts, 0.0, "filler glyph must be zero-width");
+
+        // The aggregate that actually drives positioning is untouched by
+        // Phase 1 — same value the pre-refactor two-function code produced.
+        let fi = font_widths.get("F1").unwrap();
+        let agg = compute_string_width_ts(&bytes, fi, 12.0, 0.0, 0.0);
+        assert!((agg - expected_width).abs() < 0.001);
     }
 
     #[test]

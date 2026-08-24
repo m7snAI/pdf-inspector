@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use super::fonts::{
     build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
-    extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
+    decode_operand_glyphs, get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
     FontStyleCache,
 };
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
@@ -569,7 +569,12 @@ fn extract_form_xobject_text_inner(
                         }
                         continue;
                     }
-                    if let Some(text) = extract_text_from_operand(
+                    // Phase 1: decode_operand_glyphs replaces the old
+                    // extract_text_from_operand call (see content_stream.rs's
+                    // "Tj" arm) — the separate compute_string_width_ts calls
+                    // around this one are untouched and remain the sole
+                    // source of the aggregate widths used for positioning.
+                    let (decoded_text, _glyphs) = decode_operand_glyphs(
                         show_operand,
                         &current_font,
                         font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -580,7 +585,11 @@ fn extract_form_xobject_text_inner(
                         &encoding_cache,
                         cmap_decisions,
                         &font_widths,
-                    ) {
+                        current_font_size,
+                        char_spacing,
+                        word_spacing,
+                    );
+                    if let Some(text) = decoded_text {
                         let combined = multiply_matrices(&text_matrix, &ctm);
                         let rendered_size = effective_font_size(current_font_size, &combined)
                             * type3_scales.get(&current_font).copied().unwrap_or(1.0);
@@ -725,7 +734,13 @@ fn extract_form_xobject_text_inner(
                                 }
                             }
                             if !fill_is_white {
-                                if let Some(text) = extract_text_from_operand(
+                                // Phase 1: decode_operand_glyphs replaces the
+                                // old extract_text_from_operand call — see
+                                // content_stream.rs's "Tj" arm comment.
+                                // total_width_ts above (via
+                                // compute_string_width_ts, untouched) remains
+                                // the sole aggregate width.
+                                let (decoded_text, _glyphs) = decode_operand_glyphs(
                                     element,
                                     &current_font,
                                     font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -736,7 +751,11 @@ fn extract_form_xobject_text_inner(
                                     &encoding_cache,
                                     cmap_decisions,
                                     &font_widths,
-                                ) {
+                                    current_font_size,
+                                    char_spacing,
+                                    word_spacing,
+                                );
+                                if let Some(text) = decoded_text {
                                     current_text.push_str(&text);
                                 }
                             }

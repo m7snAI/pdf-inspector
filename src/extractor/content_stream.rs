@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use super::fonts::{
     build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
-    descriptor_style_flags, extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes,
+    decode_operand_glyphs, descriptor_style_flags, get_font_file2_obj_num, get_operand_bytes,
     CMapDecisionCache, FontStyleCache,
 };
 use super::underline::UnderlineLine;
@@ -563,7 +563,14 @@ pub(crate) fn extract_page_text_items(
                         }
                         continue;
                     }
-                    if let Some(text) = extract_text_from_operand(
+                    // Phase 1 (decode/width unification): decode_operand_glyphs
+                    // replaces the old separate extract_text_from_operand call —
+                    // same decode chain, now also producing a per-glyph
+                    // breakdown (unused here yet; a later phase wires it into
+                    // pen-position tracking). `w_ts_opt` above (from
+                    // compute_string_width_ts, untouched) remains the sole
+                    // source of the aggregate width used for positioning.
+                    let (decoded_text, _glyphs) = decode_operand_glyphs(
                         &reversed_operand,
                         &current_font,
                         font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -574,7 +581,11 @@ pub(crate) fn extract_page_text_items(
                         &encoding_cache,
                         &mut cmap_decisions,
                         &font_widths,
-                    ) {
+                        current_font_size,
+                        char_spacing,
+                        word_spacing,
+                    );
+                    if let Some(text) = decoded_text {
                         let combined =
                             multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
                         let rendered_size = effective_font_size(current_font_size, &combined)
@@ -754,7 +765,12 @@ pub(crate) fn extract_page_text_items(
                                 }
                             }
                             if !is_invisible {
-                                if let Some(text) = extract_text_from_operand(
+                                // Phase 1: decode_operand_glyphs replaces the
+                                // old extract_text_from_operand call — see the
+                                // "Tj" arm's comment above. total_width_ts
+                                // above (via compute_string_width_ts,
+                                // untouched) remains the sole aggregate width.
+                                let (decoded_text, _glyphs) = decode_operand_glyphs(
                                     &reversed_element,
                                     &current_font,
                                     font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -765,7 +781,11 @@ pub(crate) fn extract_page_text_items(
                                     &encoding_cache,
                                     &mut cmap_decisions,
                                     &font_widths,
-                                ) {
+                                    current_font_size,
+                                    char_spacing,
+                                    word_spacing,
+                                );
+                                if let Some(text) = decoded_text {
                                     current_text.push_str(&text);
                                 }
                             }
@@ -884,7 +904,12 @@ pub(crate) fn extract_page_text_items(
                     || suppress_glyph_extraction
                     || op.operands.is_empty())
                 {
-                    if let Some(text) = extract_text_from_operand(
+                    // Phase 1: decode_operand_glyphs replaces the old
+                    // extract_text_from_operand call — see the "Tj" arm's
+                    // comment above. w_ts_opt above (via
+                    // compute_string_width_ts, untouched) remains the sole
+                    // aggregate width.
+                    let (decoded_text, _glyphs) = decode_operand_glyphs(
                         &op.operands[0],
                         &current_font,
                         font_base_names.get(&current_font).map(|s| s.as_str()),
@@ -895,7 +920,11 @@ pub(crate) fn extract_page_text_items(
                         &encoding_cache,
                         &mut cmap_decisions,
                         &font_widths,
-                    ) {
+                        current_font_size,
+                        char_spacing,
+                        word_spacing,
+                    );
+                    if let Some(text) = decoded_text {
                         if !text.trim().is_empty() {
                             let combined =
                                 multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
