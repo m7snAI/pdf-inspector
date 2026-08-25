@@ -3,6 +3,7 @@
 //! This module extracts text with position information for structure detection.
 
 mod base14;
+mod bidi;
 mod content_decode;
 pub(crate) mod content_stream;
 mod fonts;
@@ -652,6 +653,7 @@ pub(crate) fn pen_track_glyphs(
         g.pen = Some(pen);
         last_real_pen = Some(pen);
         let advance = fonts::glyph_advance_ts(g, char_spacing, word_spacing);
+        g.full_advance_ts = advance;
         glyph_tm[4] += advance * glyph_tm[0];
         glyph_tm[5] += advance * glyph_tm[1];
     }
@@ -681,6 +683,7 @@ pub(crate) fn push_synthetic_space_glyph(
         code_count: 0,
         space_count: 0,
         pen: Some((combined[4], combined[5])),
+        full_advance_ts: 0.0,
     });
 }
 
@@ -1155,7 +1158,28 @@ pub(crate) fn merge_text_items_with_glyphs(
         return paired;
     }
 
-    let (items, item_glyphs): (Vec<TextItem>, Vec<Vec<GlyphDecode>>) = paired.into_iter().unzip();
+    let (mut items, mut item_glyphs): (Vec<TextItem>, Vec<Vec<GlyphDecode>>) =
+        paired.into_iter().unzip();
+
+    // Phase 3: bidi classification + pen-geometry cross-check, within each
+    // pre-merge item's own glyph list (see bidi.rs's module docs for the
+    // scope decision and the unit-mismatch correction this relies on).
+    // Runs BEFORE any of the grouping/sort/merge logic below, which stays
+    // completely unchanged — this only rewrites `.text` for items where a
+    // visually-stored run was detected and reversed; `.x`/`.y`/`.width`
+    // are untouched (reversal is a textual/semantic correction, not a
+    // repositioning — the glyphs are still drawn exactly where they were).
+    // A fresh `PenContinuity` per item (cold start, no cross-item carry) —
+    // see bidi.rs's module docs, "Pen continuity" section, for why
+    // cross-item carry was tried and reverted (it corrupted word
+    // separators between independently-reversed items).
+    for (item, glyphs) in items.iter_mut().zip(item_glyphs.iter_mut()) {
+        let mut bidi_carry = bidi::PenContinuity::default();
+        if bidi::apply_bidi_reversal(glyphs, item.font_size, &mut bidi_carry) {
+            let rebuilt: String = glyphs.iter().map(|g| g.text.as_str()).collect();
+            item.text = crate::text_utils::expand_ligatures(&rebuilt);
+        }
+    }
 
     // Group items by (page, Y position) with 5pt tolerance. Groups carry
     // (original index into `items`/`item_glyphs`, &TextItem) pairs instead
@@ -1330,6 +1354,7 @@ pub(crate) fn merge_text_items_with_glyphs(
                         code_count: 0,
                         space_count: 0,
                         pen: None,
+                        full_advance_ts: 0.0,
                     });
                 }
                 text.push_str(&next.text);

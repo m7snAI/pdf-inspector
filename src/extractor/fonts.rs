@@ -1257,6 +1257,15 @@ pub(crate) struct GlyphDecode {
     /// glyph's own `glyph_advance_ts`. A `Vec<GlyphDecode>` with `pen:
     /// None` throughout means positioning hasn't run on it yet.
     pub(crate) pen: Option<(f32, f32)>,
+    /// This glyph's own `glyph_advance_ts(self, char_spacing, word_spacing)`
+    /// result — i.e. `width_ts` PLUS its Tc/Tw share, in the SAME
+    /// page-space units as `pen` (font_size/CTM already baked in, unlike
+    /// MuPDF's own `adv`, which is in unscaled em-fraction units — see
+    /// `bidi.rs`'s module docs for why that distinction matters). Filled
+    /// in by `pen_track_glyphs` alongside `pen` — `0.0` until then, same
+    /// as any other unpositioned glyph's implicit default. Phase 3's own
+    /// consumer (`bidi::apply_bidi_reversal`) is the reason this exists.
+    pub(crate) full_advance_ts: f32,
 }
 
 /// A glyph's own text-space advance, INCLUDING its share of Tc (char
@@ -1298,6 +1307,7 @@ fn glyphs_from_aligned_units(
                     code_count: 1,
                     space_count: is_space as u16,
                     pen: None,
+                    full_advance_ts: 0.0,
                 });
                 for extra in chars {
                     // Filler glyph: no code, no code_count/space_count — it
@@ -1310,6 +1320,7 @@ fn glyphs_from_aligned_units(
                         code_count: 0,
                         space_count: 0,
                         pen: None,
+                        full_advance_ts: 0.0,
                     });
                 }
             }
@@ -1320,6 +1331,7 @@ fn glyphs_from_aligned_units(
                 code_count: 1,
                 space_count: is_space as u16,
                 pen: None,
+                full_advance_ts: 0.0,
             }),
         }
     }
@@ -1346,6 +1358,7 @@ fn opaque_glyph(
         code_count: widths.len() as u16,
         space_count: space_count as u16,
         pen: None,
+        full_advance_ts: 0.0,
     }]
 }
 

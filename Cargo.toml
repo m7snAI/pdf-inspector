@@ -39,6 +39,11 @@ log = "0.4"
 regex = "1.10"
 once_cell = "1.19"
 unicode-normalization = "0.1"
+# Real Unicode Bidi_Class lookup for Phase 3's bidi classification (guess_bidi_level
+# port) — classification only, not the full UAX #9 resolution algorithm (that's
+# unicode-bidi's BidiInfo API, which this crate does not use; see the module docs
+# on the bidi detector for why the geometry-based approach is used instead).
+unicode-bidi = "0.3"
 
 # TrueType font parsing (for Identity-H CID font cmap extraction)
 ttf-parser = "0.25"
