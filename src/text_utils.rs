@@ -142,13 +142,125 @@ where
     rtl > 0 && rtl > ltr
 }
 
-pub(crate) fn sort_line_items(items: &mut [TextItem]) {
-    let rtl = is_rtl_text(items.iter().map(|i| &i.text));
-    if rtl {
-        items.sort_by(|a, b| b.x.total_cmp(&a.x));
-    } else {
-        items.sort_by(|a, b| a.x.total_cmp(&b.x));
+/// Per-item local reading-direction classification for one line's items —
+/// the fix for "Canary D" (mixed-script line majority-vote misordering,
+/// found validating Phase 3's bidi.rs against real documents: a browser
+/// print header's LTR date/time stamp sharing a line with the page's much
+/// longer RTL title). `is_rtl_text` alone decides direction for a whole
+/// line by summing character counts and taking one global vote; that's
+/// correct for the overwhelming common case (a line is genuinely one
+/// direction) but wrong when a line genuinely mixes two runs — the
+/// minority run gets voted down and swept into the majority's sort,
+/// reversing its own internal order even though none of its characters
+/// are individually wrong.
+///
+/// An item with NO alphabetic content at all (pure digits/punctuation/
+/// whitespace — e.g. a lone "/" or ":" in a date string) can't be
+/// classified on its own; it inherits the nearest resolved neighbor's
+/// direction (preceding item, or the following one if it's at the very
+/// start of the line with no preceding context yet) — the same
+/// resolution rule real bidi algorithms use for neutral characters, and
+/// the same one `bidi.rs`'s `guess_bidi_level` already applies at the
+/// character level (`BidiClass::CS | NSM | BN | B | S | WS | ON =>
+/// cur_bidi`). This keeps a lone digit or punctuation mark embedded in
+/// otherwise-uniform text from spuriously starting its own "run" — it
+/// simply joins whichever side it's part of, exactly as today.
+fn classify_line_items<T>(items: &[T], text_of: impl Fn(&T) -> &str) -> Vec<bool> {
+    let mut resolved: Vec<Option<bool>> = items
+        .iter()
+        .map(|it| {
+            let (mut rtl_count, mut ltr_count) = (0u32, 0u32);
+            for c in text_of(it).chars() {
+                if is_rtl_char(c) {
+                    rtl_count += 1;
+                } else if c.is_alphabetic() && !is_cjk_char(c) {
+                    ltr_count += 1;
+                }
+            }
+            if rtl_count > 0 && rtl_count > ltr_count {
+                Some(true)
+            } else if ltr_count > 0 {
+                Some(false)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut cur = None;
+    for slot in resolved.iter_mut() {
+        match slot {
+            Some(v) => cur = Some(*v),
+            None => *slot = cur,
+        }
     }
+    let mut cur = None;
+    for slot in resolved.iter_mut().rev() {
+        match slot {
+            Some(v) => cur = Some(*v),
+            None => *slot = cur,
+        }
+    }
+
+    // Only reached if the ENTIRE line has no alphabetic content anywhere
+    // (e.g. a line of pure numbers) — arbitrary but consistent, and
+    // matches is_rtl_text's own "no alphabetic content -> not RTL" default
+    // for that case.
+    resolved.into_iter().map(|v| v.unwrap_or(false)).collect()
+}
+
+/// Groups one line's items, in their current (stream) order, into maximal
+/// runs sharing the same `classify_line_items` direction. The common case
+/// — a genuinely single-direction line — always returns exactly one run
+/// spanning the whole slice (every non-neutral item on the line agrees,
+/// so nothing to split), behaviorally identical to a single whole-line
+/// `is_rtl_text` vote. Returns `(start, end_inclusive, is_rtl)` triples.
+pub(crate) fn group_line_runs<T>(
+    items: &[T],
+    text_of: impl Fn(&T) -> &str,
+) -> Vec<(usize, usize, bool)> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let classes = classify_line_items(items, text_of);
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < classes.len() {
+        let mut j = i;
+        while j + 1 < classes.len() && classes[j + 1] == classes[i] {
+            j += 1;
+        }
+        runs.push((i, j, classes[i]));
+        i = j + 1;
+    }
+    runs
+}
+
+/// Sorts one line's items for reading order, run-aware (see
+/// `group_line_runs`): each direction-homogeneous run is sorted by its
+/// own local direction, and runs are kept in their original stream order
+/// relative to each other — confirmed against real MuPDF ground truth on
+/// the documents this fixes (a browser print header's date block
+/// genuinely precedes the title block in stream order; re-deriving block
+/// order from X-position/majority-vote instead does not match). For a
+/// single-direction line (the common case) this reduces to exactly the
+/// same one whole-line sort `is_rtl_text` always did.
+pub(crate) fn sort_line_items(items: &mut [TextItem]) {
+    if items.len() < 2 {
+        return;
+    }
+    let runs = group_line_runs(items, |it| it.text.as_str());
+    let mut new_order: Vec<TextItem> = Vec::with_capacity(items.len());
+    for (s, e, rtl) in runs {
+        let mut block: Vec<TextItem> = items[s..=e].to_vec();
+        if rtl {
+            block.sort_by(|a, b| b.x.total_cmp(&a.x));
+        } else {
+            block.sort_by(|a, b| a.x.total_cmp(&b.x));
+        }
+        new_order.extend(block);
+    }
+    items.clone_from_slice(&new_order);
 }
 
 /// Detect if a font name indicates bold style

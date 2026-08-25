@@ -13,7 +13,8 @@ mod reading_order;
 pub(crate) mod underline;
 mod xobjects;
 
-use crate::text_utils::{is_cjk_char, is_rtl_text};
+use crate::text_utils;
+use crate::text_utils::is_cjk_char;
 use crate::tounicode::FontCMaps;
 use crate::types::{PageExtraction, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
@@ -1204,16 +1205,35 @@ pub(crate) fn merge_text_items_with_glyphs(
 
     // Sort each group by X position (direction-aware), except for lines whose
     // content stream intentionally backtracks to overlay ActualText fragments.
-    for (page, y, mut group) in line_groups {
-        let rtl = is_rtl_text(group.iter().map(|i| &i.1.text));
-        let preserve_stream_order =
-            !rtl && should_preserve_overlapping_stream_order_indexed(&group);
-        if rtl {
-            group.sort_by(|a, b| b.1.x.total_cmp(&a.1.x));
-        } else if !preserve_stream_order {
-            group.sort_by(|a, b| a.1.x.total_cmp(&b.1.x));
+    //
+    // A line is first split into direction-homogeneous BLOCKS via
+    // `text_utils::group_line_runs` (see its own doc comment — the fix for
+    // "Canary D"'s mixed-script line majority-vote misordering bug: a
+    // browser print header's short LTR date/time run sharing a line with
+    // the page's much longer RTL title was getting swept into the RTL
+    // sort and having its own item order reversed). The common case (a
+    // genuinely single-direction line) always produces exactly one block,
+    // so this loop runs its body exactly once per line, computing the
+    // exact same `rtl`/`preserve_stream_order`/sort it always did —
+    // provably unchanged for every line that isn't actually mixed. Each
+    // block then gets pushed as its OWN `ordered_line_groups` entry (same
+    // page/y as the line it came from, in the block's own stream-order
+    // position — see group_line_runs), so the merge loop below runs its
+    // existing, unchanged gap/style logic independently per block using
+    // that block's own correct direction, instead of one blended pass
+    // across a mixed line.
+    for (page, y, group) in line_groups {
+        for (start, end, rtl) in text_utils::group_line_runs(&group, |i| i.1.text.as_str()) {
+            let mut block: Vec<IndexedItem> = group[start..=end].to_vec();
+            let preserve_stream_order =
+                !rtl && should_preserve_overlapping_stream_order_indexed(&block);
+            if rtl {
+                block.sort_by(|a, b| b.1.x.total_cmp(&a.1.x));
+            } else if !preserve_stream_order {
+                block.sort_by(|a, b| a.1.x.total_cmp(&b.1.x));
+            }
+            ordered_line_groups.push((page, y, block, preserve_stream_order, rtl));
         }
-        ordered_line_groups.push((page, y, group, preserve_stream_order, rtl));
     }
 
     // Sort groups by page then Y descending (top of page first)
@@ -1442,8 +1462,17 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
     let mut result = Vec::new();
 
     for (_, _, mut group) in line_groups {
-        // Sort by X position
-        group.sort_by(|a, b| a.x.total_cmp(&b.x));
+        // Sort by X position, run-aware (see text_utils::sort_line_items's
+        // own doc comment). A naive unconditional X-ascending sort here
+        // used to be harmless because merge_text_items_with_glyphs, run
+        // just before this function (content_stream.rs), had already
+        // collapsed each line down to one merged TextItem, making this
+        // re-sort a no-op for RTL/mixed lines too. The Canary D fix (see
+        // group_line_runs) made merge_text_items_with_glyphs correctly
+        // emit TWO items for a mixed-direction line (one per direction
+        // block, in stream order) — which this naive resort would then
+        // silently undo, since it had no notion of direction at all.
+        text_utils::sort_line_items(&mut group);
 
         // Find the dominant (most common) font size in this group
         let max_fs = group.iter().map(|i| i.font_size).fold(0.0_f32, f32::max);
