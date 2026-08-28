@@ -3820,8 +3820,17 @@ pub(crate) fn load_document_from_mem_with_password(
             for repaired in repair_pdf_container_candidates(buf) {
                 match load_document_bytes(&repaired, password) {
                     Ok(doc) => {
-                        log::debug!("loaded PDF after repairing malformed container bytes");
                         let page_count = doc.get_pages().len() as u32;
+                        if page_count == 0 {
+                            // Loaded without a parse error but produced no
+                            // pages — e.g. recover_startxref_pointer() landed
+                            // on a /Prev-only continuation xref table with no
+                            // /Root. Not a real repair; keep trying the
+                            // remaining candidates instead of accepting an
+                            // empty document.
+                            continue;
+                        }
+                        log::debug!("loaded PDF after repairing malformed container bytes");
                         return Ok((doc, page_count));
                     }
                     Err(e) => {
@@ -3870,7 +3879,9 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
     let mut candidates = Vec::new();
 
     add_repair_candidate(&mut candidates, append_missing_eof_marker(buf), buf);
-    add_repair_candidate(&mut candidates, recover_startxref_pointer(buf), buf);
+    for candidate in recover_startxref_pointer_candidates(buf) {
+        add_repair_candidate(&mut candidates, Some(candidate), buf);
+    }
 
     let stripped = strip_leading_pdf_container_bytes(buf);
     if let Some(stripped_buf) = stripped.as_deref() {
@@ -3880,11 +3891,9 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
             append_missing_eof_marker(stripped_buf),
             buf,
         );
-        add_repair_candidate(
-            &mut candidates,
-            recover_startxref_pointer(stripped_buf),
-            buf,
-        );
+        for candidate in recover_startxref_pointer_candidates(stripped_buf) {
+            add_repair_candidate(&mut candidates, Some(candidate), buf);
+        }
     }
 
     candidates
@@ -3909,16 +3918,44 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
 /// Doesn't cover cross-reference *streams* (`N 0 obj << /Type /XRef ...`,
 /// used by some PDF 1.5+ writers instead of a classic table) — recovering
 /// those needs the containing object's number, not just a byte offset.
-fn recover_startxref_pointer(buf: &[u8]) -> Option<Vec<u8>> {
-    let xref_pos = find_last_valid_xref_table_start(buf)?;
+///
+/// Yields one repair candidate per valid xref-table position found
+/// scanning backward through `buf` (most recent first), not just the
+/// last one. A single corrupted `startxref` pointer is usually fixed by
+/// the last table in the file, but in a linearized/hybrid-reference PDF
+/// the last physical `xref` section can be a `/Prev`-only continuation
+/// table with no `/Root` — not a valid standalone entry point on its
+/// own. The caller tries each candidate in turn and falls back to an
+/// earlier, complete table when a later one loads but produces no pages.
+fn recover_startxref_pointer_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
+    // Bounds the scan on a pathological buffer with many coincidental
+    // "xref"-shaped matches; real PDFs need at most a handful of these.
+    const MAX_CANDIDATES: usize = 8;
 
+    let mut out = Vec::new();
+    let mut search_end = buf.len();
+    while out.len() < MAX_CANDIDATES {
+        let Some(pos) = find_last_valid_xref_table_start(&buf[..search_end]) else {
+            break;
+        };
+        out.push(build_recovered_startxref(buf, pos));
+        if pos == 0 {
+            break;
+        }
+        // Next search excludes this match and everything after it.
+        search_end = pos;
+    }
+    out
+}
+
+fn build_recovered_startxref(buf: &[u8], xref_pos: usize) -> Vec<u8> {
     let mut repaired = Vec::with_capacity(buf.len() + 32);
     repaired.extend_from_slice(buf);
     if !repaired.ends_with(b"\n") {
         repaired.push(b'\n');
     }
     repaired.extend_from_slice(format!("startxref\n{xref_pos}\n%%EOF\n").as_bytes());
-    Some(repaired)
+    repaired
 }
 
 /// Finds the last standalone `xref` token in `buf` that is immediately
@@ -7575,8 +7612,39 @@ mod tests {
     }
 
     #[test]
-    fn recover_startxref_pointer_returns_none_without_a_valid_table() {
+    fn recover_startxref_pointer_candidates_empty_without_a_valid_table() {
         let buf = b"Please refer to the xref appendix for details.";
-        assert!(recover_startxref_pointer(buf).is_none());
+        assert!(recover_startxref_pointer_candidates(buf).is_empty());
+    }
+
+    #[test]
+    fn recover_startxref_pointer_candidates_falls_back_past_a_rootless_table() {
+        // Two valid classic xref tables: an earlier, complete one (with a
+        // trailer) and a later, `/Prev`-only continuation table (no
+        // trailer content of its own) — mirroring a linearized/hybrid-
+        // reference PDF where the physically-last `xref` section in the
+        // file isn't a valid standalone entry point. The last-match
+        // candidate must come first (most recent first), but the earlier,
+        // complete table must still be produced as a fallback candidate.
+        let buf = b"xref\n0 3\n0000000000 65535 f \ntrailer\n<</Root 1 0 R>>\n\
+                    garbage in between\n\
+                    xref\n0 3\n0000000000 65535 f \ntrailer\n<</Size 3>>\n%%EOF";
+        let candidates = recover_startxref_pointer_candidates(buf);
+        assert_eq!(
+            candidates.len(),
+            2,
+            "expected both xref tables as candidates"
+        );
+
+        let last_table_pos =
+            buf.len() - b"xref\n0 3\n0000000000 65535 f \ntrailer\n<</Size 3>>\n%%EOF".len();
+        assert!(
+            candidates[0].ends_with(format!("startxref\n{last_table_pos}\n%%EOF\n").as_bytes()),
+            "first candidate should point at the last (rootless) table"
+        );
+        assert!(
+            candidates[1].ends_with(b"startxref\n0\n%%EOF\n"),
+            "second candidate should fall back to the earlier, complete table"
+        );
     }
 }
