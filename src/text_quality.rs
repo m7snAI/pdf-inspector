@@ -518,3 +518,78 @@ pub(crate) fn is_cid_garbage(text: &str) -> bool {
     let ascii_letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
     total >= 20 && high_latin * 5 >= total * 2 && ascii_letters * 3 < total
 }
+
+/// Detect OCR-misrecognition noise: word tokens dense with punctuation
+/// embedded mid-token (not at the edges), which real prose in any script
+/// essentially never produces even with normal hyphenation, possessives,
+/// or trailing punctuation.
+///
+/// This catches a different failure shape than [`is_garbage_text`] (non-
+/// alphanumeric-heavy symbol soup) or [`detect_encoding_issues`]'s
+/// substitution-cipher detector (a consistent character-shift/permutation
+/// — its own doc comment: "the signature of a substitution cipher").
+/// Random OCR misrecognition is neither: the output is still letter-shaped
+/// (so it passes an alphanumeric-ratio check) and isn't a bijective shift
+/// (so it doesn't preserve a coherent letter-frequency profile), which is
+/// why neither existing check fires on it. Real examples from a bad Tr-3
+/// OCR text layer: `t!,,t-,`, `,e/ePr2`, `8.,.,..t,,,`.
+///
+/// Validated against a 30-document known-clean corpus (Etimad tender
+/// templates, the known-good fixtures, and confirmed-clean recovered
+/// documents; max ratio 0.020) and a 199-document random sample of the
+/// finepdfs corpus: every document scoring above the chosen threshold,
+/// checked by hand, turned out to have a real, independently-confirmable
+/// content issue (OCR noise, U+FFFD replacement-character corruption, or
+/// repeated-character corruption) — not a false positive.
+pub(crate) fn is_ocr_noise(text: &str) -> bool {
+    // Strip markdown/HTML syntax this codebase adds (not present in the
+    // PDF) before tokenizing — otherwise a table row's `|`-separated
+    // cells collapse into one whitespace-free "token" full of pipes, and
+    // an `<u>...</u>` wrapper reads as embedded punctuation.
+    let cleaned = text.replace("<u>", " ").replace("</u>", " ");
+
+    let mut total = 0usize;
+    let mut noisy = 0usize;
+    for tok in cleaned.split(|c: char| c.is_whitespace() || matches!(c, '|' | '#' | '*')) {
+        let tok = tok.trim_matches('-');
+        let chars: Vec<char> = tok.chars().collect();
+        if chars.len() < 2 || !chars.iter().any(|c| c.is_alphabetic()) {
+            continue;
+        }
+        total += 1;
+        // Interior chars only — leading/trailing punctuation (a trailing
+        // comma, a closing quote) is normal in real prose.
+        let interior = &chars[1..chars.len() - 1];
+        let interior_punct = interior
+            .iter()
+            .filter(|c| {
+                !c.is_alphanumeric() && **c != '\'' && **c != '-' && !is_combining_mark(**c)
+            })
+            .count();
+        if interior_punct >= 2 {
+            noisy += 1;
+        }
+    }
+
+    // Require a statistically meaningful sample — the same discipline
+    // CipherGarbleStats::looks_garbled uses (its own minimum is 200 ASCII
+    // letters; word tokens are a coarser unit, so 40 is the matching
+    // floor here) to avoid a short sample swinging the ratio on noise.
+    total >= 40 && (noisy as f64 / total as f64) >= 0.08
+}
+
+/// Unicode combining marks (diacritics) — e.g. Arabic harakat, Latin
+/// combining accents. These attach to a base letter and are not
+/// punctuation; counting them as "noisy" would false-positive on
+/// legitimate (if imperfectly decoded) diacritic-bearing text.
+fn is_combining_mark(c: char) -> bool {
+    matches!(c,
+        '\u{0300}'..='\u{036F}'  // Combining Diacritical Marks
+        | '\u{0610}'..='\u{061A}' // Arabic combining marks
+        | '\u{064B}'..='\u{065F}' // Arabic harakat
+        | '\u{0670}'
+        | '\u{06D6}'..='\u{06DC}'
+        | '\u{06DF}'..='\u{06E8}'
+        | '\u{06EA}'..='\u{06ED}'
+    )
+}

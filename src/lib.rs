@@ -64,7 +64,7 @@ use lopdf::Document;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use text_quality::{
-    analyze_text_quality, detect_encoding_issues, is_cid_garbage, is_garbage_text,
+    analyze_text_quality, detect_encoding_issues, is_cid_garbage, is_garbage_text, is_ocr_noise,
     region_items_have_decoding_issue,
 };
 use tounicode::FontCMaps;
@@ -4361,15 +4361,21 @@ fn process_document(
         ),
     };
 
-    // If the extracted text is predominantly garbage (non-alphanumeric) and
-    // the PDF is image-backed (Mixed/template), upgrade to Scanned — the text
-    // layer comes from a bad OCR pass, and callers should use proper OCR.
-    let (pdf_type, markdown, confidence) =
-        if pdf_type == PdfType::Mixed && markdown.as_ref().is_some_and(|m| is_garbage_text(m)) {
-            (PdfType::Scanned, None, 0.95)
-        } else {
-            (pdf_type, markdown, confidence)
-        };
+    // If the extracted text is predominantly garbage (non-alphanumeric or
+    // OCR-misrecognition noise) and the PDF is image-backed (Mixed/
+    // template), upgrade to Scanned — the text layer comes from a bad OCR
+    // pass, and callers should use proper OCR. is_ocr_noise catches a
+    // failure shape is_garbage_text doesn't: letter-shaped but linguistically
+    // implausible OCR misreads (not symbol-soup, not a substitution cipher).
+    let (pdf_type, markdown, confidence) = if pdf_type == PdfType::Mixed
+        && markdown
+            .as_ref()
+            .is_some_and(|m| is_garbage_text(m) || is_ocr_noise(m))
+    {
+        (PdfType::Scanned, None, 0.95)
+    } else {
+        (pdf_type, markdown, confidence)
+    };
 
     // If a TextBased PDF produces garbage text, the fonts are undecodable
     // (e.g. Identity-H without ToUnicode for non-Latin scripts like Cyrillic).
@@ -4499,8 +4505,22 @@ fn process_document(
                 if new_chars_per_page < 50.0 && new_len < 500 {
                     return None;
                 }
-                let enc = has_encoding_issues || detect_encoding_issues(&new_markdown);
-                Some((new_markdown, new_layout, enc))
+                // A long-enough retry can still be unreliable — a bad
+                // invisible-text OCR layer is exactly the kind of content
+                // that's "long" but not real. Reject the whole retry
+                // (not just the affected portion) rather than surface
+                // low-quality text as if it were trustworthy: this
+                // document mixes clean and garbled spans within the same
+                // lines in the cases seen so far, so there's no reliable
+                // finer-grained boundary to keep only the good part.
+                if is_garbage_text(&new_markdown)
+                    || is_cid_garbage(&new_markdown)
+                    || is_ocr_noise(&new_markdown)
+                    || detect_encoding_issues(&new_markdown)
+                {
+                    return None;
+                }
+                Some((new_markdown, new_layout, has_encoding_issues))
             })();
 
             if let Some((new_markdown, new_layout, enc)) = retried {
@@ -7056,6 +7076,54 @@ mod tests {
         let cyrillic =
             "Роботизированные технологии комплексы для производства металлургических предприятий";
         assert!(!is_garbage_text(cyrillic));
+    }
+
+    #[test]
+    fn test_ocr_noise_detection() {
+        // Real excerpt from a confirmed bad Tr-3 OCR text layer
+        // (finance.gov.mv) — letter-shaped but linguistically implausible,
+        // which is exactly what is_garbage_text and detect_encoding_issues
+        // both miss.
+        let noise = "t!,,t-, ,l+ ^a ,e/ePr2 (22 8.,.,..t,,, foD 4. a.o, ..-rr2r.r2 2 2018 \
+                     I 3-D2lCIR/20 t 8/9 1439:itt0 20t8j.\"jj01 \
+                     .42rt2..-a2e-rE-2 r-rJr, C, ., trarCt.: t..e.... '.. \
+                     u.-.*r) .rrteJP r,Ferrv, v2-J /t.P2,v r-rP- ,ver2er,r-.r,r' /-rrPr) 3t 2,J, \
+                     ,2., i!.ra/r r, ,rr2 (ra22 e.n2e.,-2 p2a.,te2) 2a 22 ./ y .v2- ?2r/ o ra o. t? ?2J2 ,2J2 .., \
+                     ,t,J2.) re./z v,2..Po 2,,4 olo ..r ,t22/ r.2rt2-?t.7-Pv-?tr)/c2/ /2).v ,,--2rr) t.,ry2 \
+                     .-?2o, ta2rvt ,',,,o. .e a. ?2r2 ?t, !.Yt a !.2r/ rr? 2J J. -?2r/ ?t.r-ftY? rt-Y.-.--2aL22 \
+                     ,r,--a 2r)/e2/,.2ya, r.2r1 -l.ayt-J, 2v./tr2 t, 22 ,.y7-2 -aJ,!.4r2 't22.-) /a.,. ePr22 \
+                     tr,--2rlrtPr rt2J/ .t,a2 t 2j) o2, ?r, ,/, r\"v?-2lF-r-?rr2 ,-v!.Pta trJ2-vt42 2a L22 \
+                     14 ,yJt atreP.,22 -2va/t Pr) ,,?ro e.-)) ... ,2 22,-rt Pe.-rya ,rP /1r2 yr.] 't--2, a.?el, o2,? \
+                     t.,.v2r-t2rvr2a...?r2,trt2.v ,J.?t' t22'v,2r ao. ryt or.,d Ly eco o.. eeo vrrr 22e+ tre--av,. ,aJ";
+        assert!(is_ocr_noise(noise));
+
+        // Real clean prose (a scanned meeting-minutes OCR layer) should not
+        // trip the detector even with normal hyphenation, possessives, and
+        // stray OCR typos on individual words.
+        let clean = "MINUTES OF COMMISSIONERS COURT MEETING Attached hereto is/are public \
+                     notice(s) posted for the meeting of January 14, 2019. The minutes of the \
+                     Regular Meeting of Fayette County, Texas, Commissioners Court held in the \
+                     Commissioners Courtroom at the Fayette County Courthouse located at 151 \
+                     North Washington Street, La Grange, Texas. Bonus Insurance-Lloyd's would \
+                     be the difficult one to collect from given precedence.";
+        assert!(!is_ocr_noise(clean));
+
+        // Markdown table syntax (pipe-separated cells) must not collapse
+        // into one punctuation-dense "token" — real content inside a table
+        // should read the same as prose.
+        let table = "|Commr.|McBroom,|vote|for X, vote|against|\n|---|---|---|---|---|\n\
+                     |Commr.|Sternadel,|vote|for X, vote|against|\n\
+                     |Judge|Weber,|vote for X,|vote against|";
+        assert!(!is_ocr_noise(table));
+
+        // Arabic text with normal harakat (short-vowel diacritics) should not
+        // be mistaken for punctuation-dense noise — a font/CID issue can
+        // insert spurious diacritics without making the text unreadable, a
+        // different (and lower-severity) problem than OCR misrecognition.
+        let arabic_with_diacritics = "معلومات بالعربية حول كيفية بدء وتسجيل شركة في السويد كيف \
+                                       تقوم بتسجيل شركة في السويد وكيف يمكنك الحصول على المساعدة \
+                                       لبدء عمل تجاري في السويد باللغة العربية";
+        assert!(!is_ocr_noise(arabic_with_diacritics));
     }
 
     #[test]
