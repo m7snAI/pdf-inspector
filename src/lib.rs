@@ -4208,7 +4208,7 @@ fn process_document(
 
     let (
         markdown,
-        layout,
+        mut layout,
         has_encoding_issues,
         gid_pages,
         text_quality_pages,
@@ -4324,7 +4324,7 @@ fn process_document(
             } else {
                 Some(markdown::to_markdown_from_items_with_rects_and_lines(
                     items,
-                    options.markdown,
+                    options.markdown.clone(),
                     &rects,
                     &lines,
                     markdown::MarkdownDocumentContext {
@@ -4374,7 +4374,7 @@ fn process_document(
     // If a TextBased PDF produces garbage text, the fonts are undecodable
     // (e.g. Identity-H without ToUnicode for non-Latin scripts like Cyrillic).
     // Drop the useless markdown and flag all pages for OCR.
-    let (markdown, has_encoding_issues, force_ocr_all) = if pdf_type == PdfType::TextBased
+    let (mut markdown, mut has_encoding_issues, force_ocr_all) = if pdf_type == PdfType::TextBased
         && markdown.as_ref().is_some_and(|m| is_garbage_text(m))
     {
         log::debug!("TextBased PDF has garbage text — flagging all pages for OCR");
@@ -4415,7 +4415,13 @@ fn process_document(
 
     // Detect sparse extraction: when a TEXT-BASED PDF produces very few
     // characters per page, the text is likely embedded in images/forms
-    // that need OCR.  Flag all pages for OCR in this case.
+    // that need OCR — or the real text is present but entirely under an
+    // invisible (Tr 3) render mode (e.g. a searchable-OCR layer over a
+    // full-page scan) whose raw text-operator count was high enough to
+    // avoid the template-image heuristic and stay TextBased instead of
+    // Mixed, where the invisible-text retry above already applies.
+    // Retry with invisible text included before giving up to OCR; only
+    // flag pages for OCR if the retry doesn't recover real content.
     // Only check when markdown was actually generated (not in Analyze mode).
     if pdf_type == PdfType::TextBased
         && page_count > 0
@@ -4425,12 +4431,94 @@ fn process_document(
         let md_len = markdown.as_ref().map_or(0, |m| m.len());
         let chars_per_page = md_len as f32 / page_count as f32;
         if chars_per_page < 50.0 && md_len < 500 {
-            log::debug!(
-                "sparse extraction: {:.0} chars/page — recommending OCR for all {} pages",
-                chars_per_page,
-                page_count
-            );
-            pages_needing_ocr = (1..=page_count).collect();
+            let retried = (|| -> Option<(String, LayoutComplexity, bool)> {
+                let font_cmaps = FontCMaps::from_doc(&doc);
+                let ((items, rects, lines), page_thresholds, _gid_encoded_pages) =
+                    extractor::extract_positioned_text_include_invisible_with_folio_context(
+                        &doc,
+                        &font_cmaps,
+                        options.page_filter.as_ref(),
+                    )
+                    .ok()?;
+
+                let selected_page = |page: u32| {
+                    options
+                        .page_filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.contains(&page))
+                };
+                let rects: Vec<_> = rects
+                    .into_iter()
+                    .filter(|r| selected_page(r.page))
+                    .collect();
+                let lines: Vec<_> = lines
+                    .into_iter()
+                    .filter(|l| selected_page(l.page))
+                    .collect();
+                let FolioFilteredItems {
+                    items,
+                    layout_items,
+                    removal_mask,
+                    removed_pages,
+                } = select_items_with_document_folio_context(
+                    items,
+                    page_count,
+                    options.page_filter.as_ref(),
+                );
+
+                let chart_regions = markdown::chart_regions_by_page(&items, &rects, &lines);
+                let new_layout = compute_layout_complexity_with_chart_regions(
+                    &items,
+                    &layout_items,
+                    &rects,
+                    &lines,
+                    &chart_regions,
+                );
+                let new_markdown = markdown::to_markdown_from_items_with_rects_and_lines(
+                    items,
+                    options.markdown.clone(),
+                    &rects,
+                    &lines,
+                    markdown::MarkdownDocumentContext {
+                        page_thresholds: &page_thresholds,
+                        struct_roles: struct_roles.as_ref(),
+                        struct_tables: &struct_tables,
+                        page_count,
+                        prefiltered_page_number_pages: Some(&removed_pages),
+                        prefiltered_page_number_mask: Some(removal_mask.as_slice()),
+                        precomputed_chart_regions: Some(&chart_regions),
+                    },
+                );
+
+                // Only accept the retry if it actually clears the same
+                // sparse threshold — otherwise this document genuinely
+                // has little text (visible or invisible) and the normal
+                // OCR fallback below should still apply.
+                let new_len = new_markdown.len();
+                let new_chars_per_page = new_len as f32 / page_count as f32;
+                if new_chars_per_page < 50.0 && new_len < 500 {
+                    return None;
+                }
+                let enc = has_encoding_issues || detect_encoding_issues(&new_markdown);
+                Some((new_markdown, new_layout, enc))
+            })();
+
+            if let Some((new_markdown, new_layout, enc)) = retried {
+                log::debug!(
+                    "sparse extraction recovered via invisible-text retry: {} chars/page",
+                    new_markdown.len() as f32 / page_count as f32
+                );
+                markdown = Some(new_markdown);
+                layout = new_layout;
+                has_encoding_issues = enc;
+            } else {
+                log::debug!(
+                    "sparse extraction: {:.0} chars/page — recommending OCR for all {} pages",
+                    chars_per_page,
+                    page_count
+                );
+                pages_needing_ocr = (1..=page_count).collect();
+            }
         }
     }
 
