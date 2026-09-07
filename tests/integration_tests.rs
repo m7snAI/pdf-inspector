@@ -1429,6 +1429,28 @@ fn test_firecrawl_tagged_pdf_struct_tree() {
     assert_eq!(fence_count % 2, 0, "Code fences should be balanced");
 }
 
+/// This fixture's real body text (form labels, section headings) is rendered
+/// as images, with the actual Arabic text available only via `/ActualText`
+/// on the structure element wrapping each image's marked-content span — no
+/// ToUnicode/CMap on the content stream's own fonts covers it at all. Before
+/// `promote_actual_text_images` wired that up, extraction produced almost
+/// nothing but stray bullet glyphs and blank table cells for these spans.
+#[test]
+fn test_struct_tree_actual_text_recovers_image_only_content() {
+    let buf = std::fs::read("tests/fixtures/struct_tree_actual_text_images.pdf").unwrap();
+    let result = pdf_inspector::process_pdf_mem(&buf).unwrap();
+    let md = result.markdown.unwrap();
+
+    assert!(
+        md.contains("استمارة طلب ترخيص ممارسة طبية"),
+        "Should recover the form's real Arabic title via ActualText, not just its bullet glyphs"
+    );
+    assert!(
+        !md.contains("[Image:"),
+        "Every image on this fixture has an ActualText override — none should survive as a placeholder"
+    );
+}
+
 #[test]
 fn test_tagged_pdf_text_items_carry_mcid() {
     let buf = std::fs::read("tests/fixtures/firecrawl_docs_tagged.pdf").unwrap();

@@ -4188,23 +4188,42 @@ fn process_document(
     };
 
     // Parse structure tree for tagged PDFs (reuses the loaded document)
-    let (struct_roles, struct_tables) = structure_tree::StructTree::from_doc(&doc)
-        .map(|tree| {
-            let page_ids = doc.get_pages();
-            let roles = tree.mcid_to_roles(&page_ids);
-            let tables = tree.extract_tables(&page_ids);
-            if !roles.is_empty() {
-                log::debug!(
-                    "structure tree: {} pages with MCID roles, {} total MCIDs, {} tagged tables",
-                    roles.len(),
-                    tree.mcid_count(),
-                    tables.len()
-                );
-            }
-            let roles = if roles.is_empty() { None } else { Some(roles) };
-            (roles, tables)
-        })
-        .unwrap_or((None, Vec::new()));
+    let (struct_roles, struct_tables, actual_text_by_mcid) =
+        structure_tree::StructTree::from_doc(&doc)
+            .map(|tree| {
+                let page_ids = doc.get_pages();
+                let roles = tree.mcid_to_roles(&page_ids);
+                let tables = tree.extract_tables(&page_ids);
+                let actual_text = tree.actual_text_by_mcid(&page_ids);
+                if !roles.is_empty() {
+                    log::debug!(
+                "structure tree: {} pages with MCID roles, {} total MCIDs, {} tagged tables",
+                roles.len(),
+                tree.mcid_count(),
+                tables.len()
+            );
+                }
+                if !actual_text.is_empty() {
+                    log::debug!(
+                        "structure tree: {} pages with ActualText overrides",
+                        actual_text.len()
+                    );
+                }
+                let roles = if roles.is_empty() { None } else { Some(roles) };
+                (roles, tables, actual_text)
+            })
+            .unwrap_or((None, Vec::new(), HashMap::new()));
+
+    // Some PDF producers render real text as images (per-glyph substitution,
+    // or entire runs via a rasterized print pipeline) while keeping the real
+    // text available only as `/ActualText` on the structure element that
+    // wraps the image's marked-content span — the content stream itself has
+    // no decodable text for it. Promote such image placeholders to real text
+    // items now, before any page-quality/OCR-routing decisions look at them.
+    let extracted = extracted.map(|((mut items, rects, lines), page_thresholds, gid_pages)| {
+        promote_actual_text_images(&mut items, &actual_text_by_mcid);
+        ((items, rects, lines), page_thresholds, gid_pages)
+    });
 
     let (
         markdown,
@@ -4575,6 +4594,228 @@ fn process_document(
 // =========================================================================
 // Internal helpers
 // =========================================================================
+
+/// Promote `ItemType::Image` placeholders to real text when the structure
+/// tree supplies `/ActualText` for their marked-content span — the case
+/// where a PDF producer rendered real text as an image (a single
+/// substituted glyph, or an entire run via a rasterized print pipeline)
+/// while keeping the real text available only through the structure tree,
+/// never in the content stream.
+///
+/// Never overrides a span that already has real (non-image, non-empty)
+/// text: that's either the ligature-substitution case (already handled at
+/// extraction time in `extractor::content_stream`, where `/ActualText` is
+/// inline in the marked-content property list and there's a real glyph to
+/// anchor position to) or content this crate already decoded correctly —
+/// ActualText should never compete with or duplicate genuine output.
+///
+/// When more than one image shares an MCID (a span wrapping multiple `Do`
+/// calls), only the first is promoted; the rest are dropped as duplicate
+/// placeholders for the same recovered text.
+fn promote_actual_text_images(
+    items: &mut Vec<types::TextItem>,
+    actual_text_by_mcid: &HashMap<u32, HashMap<i64, String>>,
+) {
+    if actual_text_by_mcid.is_empty() {
+        return;
+    }
+
+    let mut has_real_text: HashSet<(u32, i64)> = HashSet::new();
+    for item in items.iter() {
+        if let Some(mcid) = item.mcid {
+            if !matches!(item.item_type, types::ItemType::Image) && !item.text.trim().is_empty() {
+                has_real_text.insert((item.page, mcid));
+            }
+        }
+    }
+    // Median height of genuine text on each page, used to keep a promoted
+    // item's height plausible: an image can span an entire paragraph, and
+    // that height would otherwise read as a large heading to the
+    // font-size-based heading-tier heuristic downstream.
+    let mut heights_by_page: HashMap<u32, Vec<f32>> = HashMap::new();
+    for item in items.iter() {
+        if !matches!(item.item_type, types::ItemType::Image) && item.height > 0.0 {
+            heights_by_page
+                .entry(item.page)
+                .or_default()
+                .push(item.height);
+        }
+    }
+    let median_height_by_page: HashMap<u32, f32> = heights_by_page
+        .into_iter()
+        .map(|(page, mut heights)| {
+            heights.sort_by(|a, b| a.total_cmp(b));
+            (page, heights[heights.len() / 2])
+        })
+        .collect();
+
+    let mut substituted: HashSet<(u32, i64)> = HashSet::new();
+    items.retain_mut(|item| {
+        let (types::ItemType::Image, Some(mcid)) = (&item.item_type, item.mcid) else {
+            return true;
+        };
+        let key = (item.page, mcid);
+        if has_real_text.contains(&key) {
+            return true;
+        }
+        let Some(actual_text) = actual_text_by_mcid
+            .get(&item.page)
+            .and_then(|m| m.get(&mcid))
+        else {
+            return true;
+        };
+        if actual_text.trim().is_empty() {
+            return true;
+        }
+        if !substituted.insert(key) {
+            // Another image in this same marked-content span already
+            // carries the recovered text — drop this duplicate placeholder.
+            return false;
+        }
+        item.text = actual_text.clone();
+        item.item_type = types::ItemType::Text;
+        if let Some(&median) = median_height_by_page.get(&item.page) {
+            item.height = item.height.min(median * 1.5);
+        }
+        item.font_size = item.height;
+        true
+    });
+}
+
+#[cfg(test)]
+mod promote_actual_text_images_tests {
+    use super::*;
+
+    fn image_item(page: u32, mcid: Option<i64>, height: f32) -> TextItem {
+        TextItem {
+            text: "[Image: Im0]".to_string(),
+            x: 10.0,
+            y: 700.0,
+            width: 100.0,
+            height,
+            font: String::new(),
+            font_size: 0.0,
+            page,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: types::ItemType::Image,
+            mcid,
+        }
+    }
+
+    fn text_item(page: u32, mcid: Option<i64>, text: &str, height: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x: 10.0,
+            y: 680.0,
+            width: 100.0,
+            height,
+            font: "Test".to_string(),
+            font_size: height,
+            page,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: types::ItemType::Text,
+            mcid,
+        }
+    }
+
+    #[test]
+    fn promotes_image_placeholder_with_no_real_text() {
+        let mut items = vec![image_item(1, Some(0), 12.0)];
+        let mut mcid_map = HashMap::new();
+        mcid_map.insert(0i64, "real Thaana text".to_string());
+        let mut actual_text_by_mcid = HashMap::new();
+        actual_text_by_mcid.insert(1u32, mcid_map);
+
+        promote_actual_text_images(&mut items, &actual_text_by_mcid);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "real Thaana text");
+        assert!(matches!(items[0].item_type, types::ItemType::Text));
+    }
+
+    #[test]
+    fn never_overrides_a_span_that_already_has_real_text() {
+        let mut items = vec![
+            text_item(1, Some(0), "already decoded correctly", 10.0),
+            image_item(1, Some(0), 12.0),
+        ];
+        let mut mcid_map = HashMap::new();
+        mcid_map.insert(0i64, "should not be used".to_string());
+        let mut actual_text_by_mcid = HashMap::new();
+        actual_text_by_mcid.insert(1u32, mcid_map);
+
+        promote_actual_text_images(&mut items, &actual_text_by_mcid);
+
+        // The image placeholder is left untouched — real text already
+        // covers this span, so ActualText must never compete with it.
+        assert_eq!(items[0].text, "already decoded correctly");
+        assert_eq!(items[1].text, "[Image: Im0]");
+        assert!(matches!(items[1].item_type, types::ItemType::Image));
+    }
+
+    #[test]
+    fn drops_duplicate_images_sharing_one_mcid() {
+        let mut items = vec![image_item(1, Some(0), 12.0), image_item(1, Some(0), 12.0)];
+        let mut mcid_map = HashMap::new();
+        mcid_map.insert(0i64, "one recovered run".to_string());
+        let mut actual_text_by_mcid = HashMap::new();
+        actual_text_by_mcid.insert(1u32, mcid_map);
+
+        promote_actual_text_images(&mut items, &actual_text_by_mcid);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "one recovered run");
+    }
+
+    #[test]
+    fn caps_an_oversized_image_height_to_the_page_text_scale() {
+        // A paragraph-sized image (much taller than the page's real text)
+        // must not read as a giant heading downstream.
+        let mut items = vec![
+            text_item(1, None, "normal body text", 10.0),
+            text_item(1, None, "normal body text", 10.0),
+            image_item(1, Some(0), 400.0),
+        ];
+        let mut mcid_map = HashMap::new();
+        mcid_map.insert(0i64, "recovered paragraph".to_string());
+        let mut actual_text_by_mcid = HashMap::new();
+        actual_text_by_mcid.insert(1u32, mcid_map);
+
+        promote_actual_text_images(&mut items, &actual_text_by_mcid);
+
+        let promoted = items
+            .iter()
+            .find(|i| i.text == "recovered paragraph")
+            .unwrap();
+        assert!(
+            promoted.height <= 15.0,
+            "height should be capped near the page's real text scale, got {}",
+            promoted.height
+        );
+    }
+
+    #[test]
+    fn leaves_images_with_no_mcid_or_no_actual_text_entry_untouched() {
+        let mut items = vec![image_item(1, None, 12.0), image_item(1, Some(5), 12.0)];
+        let mut mcid_map = HashMap::new();
+        mcid_map.insert(0i64, "unrelated mcid".to_string());
+        let mut actual_text_by_mcid = HashMap::new();
+        actual_text_by_mcid.insert(1u32, mcid_map);
+
+        promote_actual_text_images(&mut items, &actual_text_by_mcid);
+
+        assert_eq!(items.len(), 2);
+        assert!(items
+            .iter()
+            .all(|i| matches!(i.item_type, types::ItemType::Image)));
+    }
+}
 
 fn suspected_garbled_reason() -> String {
     OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()

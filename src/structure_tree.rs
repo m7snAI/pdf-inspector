@@ -378,6 +378,55 @@ impl StructTree {
         }
     }
 
+    /// Build per-page MCID → ActualText lookup.
+    ///
+    /// Returns a map: page_number (1-indexed) → (MCID → ActualText string).
+    /// Only marked-content references belonging to a structure element that
+    /// declares `/ActualText` are included — most tagged PDFs don't use
+    /// ActualText at all, so this is typically empty.
+    ///
+    /// This is the "actual text" mechanism used by PDF producers that render
+    /// real text as images (a specific glyph substitution, or entire runs
+    /// via a rasterized print pipeline) while keeping searchable/accessible
+    /// text available only through the structure tree, not the content
+    /// stream. Never falls back to `/Alt` — that's a description of the
+    /// content (e.g. "a photo of a cat"), not a literal transcript, and
+    /// substituting it would misrepresent the page.
+    pub fn actual_text_by_mcid(
+        &self,
+        page_ids: &std::collections::BTreeMap<u32, ObjectId>,
+    ) -> HashMap<u32, HashMap<i64, String>> {
+        let obj_to_page: HashMap<ObjectId, u32> =
+            page_ids.iter().map(|(&num, &id)| (id, num)).collect();
+
+        let mut result: HashMap<u32, HashMap<i64, String>> = HashMap::new();
+        self.collect_mcid_actual_text(&self.children, &obj_to_page, &mut result);
+        result
+    }
+
+    fn collect_mcid_actual_text(
+        &self,
+        elements: &[StructElement],
+        obj_to_page: &HashMap<ObjectId, u32>,
+        result: &mut HashMap<u32, HashMap<i64, String>>,
+    ) {
+        for elem in elements {
+            if let Some(actual_text) = &elem.actual_text {
+                for mcref in &elem.content_refs {
+                    if let Some(page_id) = mcref.page_id {
+                        if let Some(&page_num) = obj_to_page.get(&page_id) {
+                            result
+                                .entry(page_num)
+                                .or_default()
+                                .insert(mcref.mcid, actual_text.clone());
+                        }
+                    }
+                }
+            }
+            self.collect_mcid_actual_text(&elem.children, obj_to_page, result);
+        }
+    }
+
     /// Count total marked-content references across the tree.
     pub fn mcid_count(&self) -> usize {
         fn count(elements: &[StructElement]) -> usize {
@@ -1528,6 +1577,72 @@ mod tests {
         let page1 = roles.get(&1).unwrap();
         assert_eq!(page1.get(&0), Some(&StructRole::H1));
         assert_eq!(page1.get(&1), Some(&StructRole::P));
+    }
+
+    #[test]
+    fn test_actual_text_by_mcid() {
+        use std::collections::BTreeMap;
+
+        let page_id: ObjectId = (5, 0);
+        let mut page_ids = BTreeMap::new();
+        page_ids.insert(1u32, page_id);
+
+        let tree = StructTree {
+            children: vec![StructElement {
+                role: StructRole::Document,
+                alt_text: None,
+                actual_text: None,
+                lang: None,
+                content_refs: Vec::new(),
+                children: vec![
+                    // A span whose real content is only available as
+                    // ActualText — the pathological case this exists for.
+                    StructElement {
+                        role: StructRole::Span,
+                        alt_text: None,
+                        actual_text: Some("real text".to_string()),
+                        lang: None,
+                        content_refs: vec![MarkedContentRef {
+                            mcid: 0,
+                            page_id: Some(page_id),
+                        }],
+                        children: Vec::new(),
+                    },
+                    // A normal paragraph with no ActualText override — must
+                    // not appear in the lookup at all.
+                    StructElement {
+                        role: StructRole::P,
+                        alt_text: None,
+                        actual_text: None,
+                        lang: None,
+                        content_refs: vec![MarkedContentRef {
+                            mcid: 1,
+                            page_id: Some(page_id),
+                        }],
+                        children: Vec::new(),
+                    },
+                    // A figure with only Alt text (a description, not a
+                    // transcript) — must never be treated as ActualText.
+                    StructElement {
+                        role: StructRole::Figure,
+                        alt_text: Some("a photo of a cat".to_string()),
+                        actual_text: None,
+                        lang: None,
+                        content_refs: vec![MarkedContentRef {
+                            mcid: 2,
+                            page_id: Some(page_id),
+                        }],
+                        children: Vec::new(),
+                    },
+                ],
+            }],
+        };
+
+        let actual_text = tree.actual_text_by_mcid(&page_ids);
+        let page1 = actual_text.get(&1).unwrap();
+        assert_eq!(page1.get(&0).map(String::as_str), Some("real text"));
+        assert_eq!(page1.get(&1), None);
+        assert_eq!(page1.get(&2), None);
     }
 
     #[test]
