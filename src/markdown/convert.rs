@@ -105,6 +105,7 @@ fn positioned_block_precedes_line(block: &PositionedMarkdown, line: &TextLine) -
 enum PositionedBlockKind {
     Table,
     Image,
+    Annotation,
 }
 
 type PositionedBlockRef<'a> = (PositionedBlockKind, usize, &'a PositionedMarkdown);
@@ -134,6 +135,7 @@ fn positioned_blocks_for_page<'a>(
     page: u32,
     page_tables: &'a HashMap<u32, Vec<PositionedMarkdown>>,
     page_images: &'a HashMap<u32, Vec<PositionedMarkdown>>,
+    page_annotations: &'a HashMap<u32, Vec<PositionedMarkdown>>,
 ) -> Vec<PositionedBlockRef<'a>> {
     let mut blocks = Vec::new();
     if let Some(tables) = page_tables.get(&page) {
@@ -150,6 +152,14 @@ fn positioned_blocks_for_page<'a>(
                 .iter()
                 .enumerate()
                 .map(|(idx, image)| (PositionedBlockKind::Image, idx, image)),
+        );
+    }
+    if let Some(annotations) = page_annotations.get(&page) {
+        blocks.extend(
+            annotations
+                .iter()
+                .enumerate()
+                .map(|(idx, annotation)| (PositionedBlockKind::Annotation, idx, annotation)),
         );
     }
     blocks.sort_by(compare_positioned_blocks);
@@ -638,11 +648,13 @@ fn count_table_columns(table_md: &str) -> usize {
 }
 
 /// Flush any remaining tables and images for a given page
+#[allow(clippy::too_many_arguments)]
 fn flush_page_tables_and_images(
     page: u32,
     page_blocks: &HashMap<u32, Vec<PositionedBlockRef<'_>>>,
     inserted_tables: &mut HashSet<(u32, usize)>,
     inserted_images: &mut HashSet<(u32, usize)>,
+    inserted_annotations: &mut HashSet<(u32, usize)>,
     output: &mut String,
     in_paragraph: &mut bool,
 ) {
@@ -653,6 +665,7 @@ fn flush_page_tables_and_images(
         let already_inserted = match kind {
             PositionedBlockKind::Table => inserted_tables.contains(&(page, idx)),
             PositionedBlockKind::Image => inserted_images.contains(&(page, idx)),
+            PositionedBlockKind::Annotation => inserted_annotations.contains(&(page, idx)),
         };
         if already_inserted {
             continue;
@@ -671,23 +684,32 @@ fn flush_page_tables_and_images(
             PositionedBlockKind::Image => {
                 inserted_images.insert((page, idx));
             }
+            PositionedBlockKind::Annotation => {
+                inserted_annotations.insert((page, idx));
+            }
         }
     }
 }
 
 /// Convert text lines to markdown, inserting tables and images at appropriate Y positions
+#[allow(clippy::too_many_arguments)]
 pub(super) fn to_markdown_from_lines_with_tables_and_images(
     lines: Vec<TextLine>,
     options: MarkdownOptions,
     page_tables: std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
     page_images: std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
+    page_annotations: std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
     page_chart_regions: &std::collections::HashMap<u32, Vec<(f32, f32, f32, f32)>>,
     band_split_pages: &HashSet<u32>,
     struct_roles: Option<
         &std::collections::HashMap<u32, std::collections::HashMap<i64, StructRole>>,
     >,
 ) -> String {
-    if lines.is_empty() && page_tables.is_empty() && page_images.is_empty() {
+    if lines.is_empty()
+        && page_tables.is_empty()
+        && page_images.is_empty()
+        && page_annotations.is_empty()
+    {
         return String::new();
     }
 
@@ -795,24 +817,28 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let mut toc_suppress_page: Option<u32> = None;
     let mut inserted_tables: HashSet<(u32, usize)> = HashSet::new();
     let mut inserted_images: HashSet<(u32, usize)> = HashSet::new();
+    let mut inserted_annotations: HashSet<(u32, usize)> = HashSet::new();
 
-    // Collect all pages that have tables or images (including image-only pages)
+    // Collect all pages that have tables, images, or annotations (including
+    // content-only pages with no text lines)
     let mut all_content_pages: Vec<u32> = page_tables
         .keys()
         .chain(page_images.keys())
+        .chain(page_annotations.keys())
         .copied()
         .collect();
     all_content_pages.sort();
     all_content_pages.dedup();
-    // Build the unified table/image order once per page. This is only a
-    // meaningful sort on chart/prose pages; ordinary pages retain their
-    // legacy table-then-image order without repeating work for every line.
+    // Build the unified table/image/annotation order once per page. This is
+    // only a meaningful sort on chart/prose pages; ordinary pages retain
+    // their legacy table-then-image-then-annotation order without repeating
+    // work for every line.
     let page_blocks: HashMap<u32, Vec<PositionedBlockRef<'_>>> = all_content_pages
         .iter()
         .map(|&page| {
             (
                 page,
-                positioned_blocks_for_page(page, &page_tables, &page_images),
+                positioned_blocks_for_page(page, &page_tables, &page_images, &page_annotations),
             )
         })
         .collect();
@@ -831,6 +857,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                     &page_blocks,
                     &mut inserted_tables,
                     &mut inserted_images,
+                    &mut inserted_annotations,
                     &mut output,
                     &mut in_paragraph,
                 );
@@ -855,6 +882,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                     &page_blocks,
                     &mut inserted_tables,
                     &mut inserted_images,
+                    &mut inserted_annotations,
                     &mut output,
                     &mut in_paragraph,
                 );
@@ -875,14 +903,18 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             }
         }
 
-        // Insert tables and images through one ordered stream. Chart/prose
-        // pages sort by zone, column, and physical Y; ordinary pages retain
-        // the legacy table-then-image input order.
+        // Insert tables, images, and annotations through one ordered stream.
+        // Chart/prose pages sort by zone, column, and physical Y; ordinary
+        // pages retain the legacy table-then-image-then-annotation input
+        // order.
         if let Some(blocks) = page_blocks.get(&current_page) {
             for &(kind, idx, block) in blocks {
                 let already_inserted = match kind {
                     PositionedBlockKind::Table => inserted_tables.contains(&(current_page, idx)),
                     PositionedBlockKind::Image => inserted_images.contains(&(current_page, idx)),
+                    PositionedBlockKind::Annotation => {
+                        inserted_annotations.contains(&(current_page, idx))
+                    }
                 };
                 if positioned_block_precedes_line(block, line) && !already_inserted {
                     // Code lines buffer until their block closes; flush them
@@ -907,6 +939,9 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                         }
                         PositionedBlockKind::Image => {
                             inserted_images.insert((current_page, idx));
+                        }
+                        PositionedBlockKind::Annotation => {
+                            inserted_annotations.insert((current_page, idx));
                         }
                     }
                 }
@@ -1249,6 +1284,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         &page_blocks,
         &mut inserted_tables,
         &mut inserted_images,
+        &mut inserted_annotations,
         &mut output,
         &mut in_paragraph,
     );
@@ -1261,6 +1297,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             &page_blocks,
             &mut inserted_tables,
             &mut inserted_images,
+            &mut inserted_annotations,
             &mut output,
             &mut in_paragraph,
         );
@@ -1656,6 +1693,7 @@ mod tests {
             MarkdownOptions::default(),
             tables,
             images,
+            HashMap::new(),
             &HashMap::new(),
             &HashSet::from([1]),
             None,
@@ -1732,6 +1770,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
@@ -1759,6 +1798,7 @@ mod tests {
         let md = to_markdown_from_lines_with_tables_and_images(
             lines,
             MarkdownOptions::default(),
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             &HashMap::new(),
@@ -1803,6 +1843,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
@@ -1838,6 +1879,7 @@ mod tests {
         let md = to_markdown_from_lines_with_tables_and_images(
             lines,
             MarkdownOptions::default(),
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             &HashMap::new(),
@@ -1876,6 +1918,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
@@ -1904,6 +1947,7 @@ mod tests {
         let md = to_markdown_from_lines_with_tables_and_images(
             lines,
             MarkdownOptions::default(),
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             &HashMap::new(),
@@ -1946,6 +1990,7 @@ mod tests {
         let md = to_markdown_from_lines_with_tables_and_images(
             lines,
             MarkdownOptions::default(),
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             &HashMap::new(),
@@ -1995,6 +2040,7 @@ mod tests {
         let md = to_markdown_from_lines_with_tables_and_images(
             lines,
             MarkdownOptions::default(),
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             &HashMap::new(),
@@ -2099,6 +2145,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
             &HashMap::new(),
             &std::collections::HashSet::new(),
             None,
@@ -2145,6 +2192,7 @@ mod tests {
         let md = to_markdown_from_lines_with_tables_and_images(
             lines,
             MarkdownOptions::default(),
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             &HashMap::new(),
@@ -2285,6 +2333,7 @@ mod tests {
         let md = to_markdown_from_lines_with_tables_and_images(
             lines,
             MarkdownOptions::default(),
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             &HashMap::new(),

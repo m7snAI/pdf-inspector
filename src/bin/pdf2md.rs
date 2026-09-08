@@ -62,6 +62,7 @@ fn item_type_label(item_type: &ItemType) -> &'static str {
         ItemType::Image => "image",
         ItemType::Link(_) => "link",
         ItemType::FormField => "form_field",
+        ItemType::Annotation => "annotation",
     }
 }
 

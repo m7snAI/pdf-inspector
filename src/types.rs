@@ -57,6 +57,11 @@ pub enum ItemType {
     Link(String),
     /// Form field (name: value)
     FormField,
+    /// Text recovered from a page annotation (e.g. a `/FreeText` note or
+    /// stamp), not from the page's main content stream. Kept distinct from
+    /// `Text` so downstream consumers don't silently merge annotation text
+    /// into body paragraphs.
+    Annotation,
 }
 
 /// Layout complexity analysis result.

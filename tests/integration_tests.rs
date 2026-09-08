@@ -1451,6 +1451,53 @@ fn test_struct_tree_actual_text_recovers_image_only_content() {
     );
 }
 
+/// This fixture is page 1 of a real scanned document
+/// (libyanconstitutionalunion.org__CC-MAIN-2018-51.pdf) whose only text is a
+/// `/FreeText` annotation watermarking the page with the site's URL — the
+/// page body itself is a full-page raster image with no extractable glyphs.
+/// Before annotation extraction existed, this page's only recovered item was
+/// an `[Image: ...]` placeholder.
+#[test]
+fn test_freetext_annotation_recovered_on_scanned_page() {
+    let buf = std::fs::read("tests/fixtures/freetext_annotation_scanned_page.pdf").unwrap();
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+
+    let annotations: Vec<&TextItem> = items
+        .iter()
+        .filter(|item| matches!(item.item_type, ItemType::Annotation))
+        .collect();
+    assert_eq!(
+        annotations.len(),
+        1,
+        "Should recover exactly one FreeText annotation: {items:?}"
+    );
+    assert_eq!(
+        annotations[0].text.trim(),
+        "www.libyanconstitutionalunion.org"
+    );
+}
+
+/// Annotation text must render as its own block, distinct from body
+/// paragraphs, rather than silently merging into surrounding prose the way a
+/// plain `Text` item would.
+#[test]
+fn test_freetext_annotation_renders_as_distinct_block() {
+    let buf = std::fs::read("tests/fixtures/freetext_annotation_with_body_text.pdf").unwrap();
+    let result = process_pdf_mem(&buf).unwrap();
+    let md = result.markdown.unwrap();
+
+    assert!(md.contains("This is the first paragraph of real body text."));
+    assert!(md.contains("This is a second paragraph, unrelated to any annotation."));
+    assert!(
+        md.contains("> Reviewer comment: please check this section."),
+        "Annotation text should render as a blockquote block: {md}"
+    );
+    assert!(
+        !md.contains("annotation.\nReviewer") && !md.contains("annotation. Reviewer"),
+        "Annotation text must not merge into the preceding body paragraph: {md}"
+    );
+}
+
 #[test]
 fn test_tagged_pdf_text_items_carry_mcid() {
     let buf = std::fs::read("tests/fixtures/firecrawl_docs_tagged.pdf").unwrap();

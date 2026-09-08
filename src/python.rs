@@ -564,6 +564,7 @@ fn item_type_str(t: &ItemType) -> String {
         ItemType::Image => "image".into(),
         ItemType::Link(url) => format!("link:{url}"),
         ItemType::FormField => "form_field".into(),
+        ItemType::Annotation => "annotation".into(),
     }
 }
 

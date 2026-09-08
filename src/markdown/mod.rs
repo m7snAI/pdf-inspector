@@ -93,6 +93,29 @@ fn items_outside_chart_regions(
         .collect()
 }
 
+/// Render annotation text as a blockquote block, one `>`-prefixed line per
+/// source line. PDF annotation `/Contents` strings commonly end in a bare
+/// `\r` (Acrobat's line terminator), so normalize all of CRLF/CR/LF before
+/// splitting.
+fn format_annotation_markdown(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = normalized
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for line in lines {
+        out.push_str("> ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 pub(crate) fn merge_chart_regions(
     regions: impl IntoIterator<Item = (f32, f32, f32, f32)>,
 ) -> Vec<(f32, f32, f32, f32)> {
@@ -1057,6 +1080,9 @@ pub struct MarkdownOptions {
     pub include_images: bool,
     /// Include extracted hyperlinks
     pub include_links: bool,
+    /// Include text recovered from page annotations (e.g. `/FreeText` notes)
+    /// as blockquote-style blocks, kept separate from body paragraphs
+    pub include_annotations: bool,
     /// Insert page break markers (<!-- Page N -->) between pages
     pub include_page_numbers: bool,
     /// Strip repeated headers/footers that appear on many pages
@@ -1088,6 +1114,7 @@ impl Default for MarkdownOptions {
             // pipelines) that want to crop + caption figures themselves.
             include_images: false,
             include_links: true,
+            include_annotations: true,
             include_page_numbers: false,
             strip_headers_footers: true,
         }
@@ -1263,11 +1290,17 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     let mut images: Vec<TextItem> = Vec::new();
     let mut page_image_regions: HashMap<u32, Vec<(f32, f32, f32, f32)>> = HashMap::new();
     let mut links: Vec<TextItem> = Vec::new();
+    let mut annotations: Vec<TextItem> = Vec::new();
     let mut text_items: Vec<TextItem> = Vec::new();
     let mut text_item_page_number_mask: Vec<bool> = Vec::new();
 
     for (input_index, item) in items.into_iter().enumerate() {
         match &item.item_type {
+            ItemType::Annotation => {
+                if options.include_annotations && !item.text.trim().is_empty() {
+                    annotations.push(item);
+                }
+            }
             ItemType::Image => {
                 page_image_regions.entry(item.page).or_default().push((
                     item.x,
@@ -1889,6 +1922,27 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             ));
     }
 
+    // Annotation text (e.g. `/FreeText` notes) is likewise removed before line
+    // grouping and reinserted as its own blockquote-style block, so it can
+    // never silently merge into a body paragraph the way a plain `Text` item
+    // would.
+    let mut page_annotations: HashMap<u32, Vec<PositionedMarkdown>> = HashMap::new();
+    for annot in &annotations {
+        let annot_md = format_annotation_markdown(&annot.text);
+        if annot_md.is_empty() {
+            continue;
+        }
+        page_annotations
+            .entry(annot.page)
+            .or_default()
+            .push(PositionedMarkdown::new(
+                annot.y,
+                annot.x,
+                annot_md,
+                page_chart_prose_orders.get(&annot.page).copied(),
+            ));
+    }
+
     // Check structure tree coverage on ALL text items (before table filtering)
     // to decide whether to use structure-aware markdown generation.
     let struct_roles_coverage_ok = struct_roles.is_some_and(|roles| {
@@ -2130,6 +2184,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         options,
         page_tables,
         page_images,
+        page_annotations,
         &page_chart_map,
         &band_split_page_set,
         effective_struct_roles,

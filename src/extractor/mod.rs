@@ -2,6 +2,7 @@
 //!
 //! This module extracts text with position information for structure detection.
 
+mod annotations;
 mod base14;
 mod bidi;
 mod content_decode;
@@ -23,6 +24,7 @@ use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use annotations::extract_page_annotation_text;
 use content_stream::extract_page_text_items;
 pub(crate) use fonts::GlyphDecode;
 use links::{extract_form_fields, extract_page_links};
@@ -417,18 +419,25 @@ fn extract_positioned_text_impl(
 
         // Extract hyperlinks from page annotations
         let mut links = extract_page_links(doc, page_id, *page_num);
+        // Extract FreeText annotation text (comments, notes, watermark boxes)
+        let mut page_annotation_items =
+            extract_page_annotation_text(doc, page_id, *page_num, font_cmaps, &mut style_cache);
         // Annotations from the neighboring page are off-box too.
         if let Some((bx0, by0, bx1, by1)) = clipped_box {
-            links.retain(|it| {
+            let in_box = |it: &TextItem| {
                 let cx = it.x + it.width / 2.0;
-                // Center-y, not it.y: link items carry an annotation rect,
-                // so y is a box edge — unlike text items, where y is a
-                // baseline and testing it directly is the natural semantics.
+                // Center-y, not it.y: link/annotation items carry an
+                // annotation rect, so y is a box edge — unlike text items,
+                // where y is a baseline and testing it directly is the
+                // natural semantics.
                 let cy = it.y + it.height / 2.0;
                 cx >= bx0 - 6.0 && cx <= bx1 + 6.0 && cy >= by0 - 6.0 && cy <= by1 + 6.0
-            });
+            };
+            links.retain(in_box);
+            page_annotation_items.retain(in_box);
         }
         all_items.extend(links);
+        all_items.extend(page_annotation_items);
     }
 
     // Extract AcroForm field values
@@ -520,11 +529,16 @@ fn suppress_table_underlines(
 /// Image XObjects emit a positional placeholder via
 /// `extract_text_with_positions` (so layout-aware callers can crop +
 /// caption figures), but their bboxes don't carry text glyphs and would
-/// skew column/row clustering if they reached the heuristics. Hyperlinks
-/// and form fields *do* participate — the existing logic treats them as
-/// text-like and we keep that.
+/// skew column/row clustering if they reached the heuristics. Annotation
+/// text is likewise a floating box anchored over the page (a comment, a
+/// watermark) rather than glyphs laid out in the body flow, so it's excluded
+/// for the same reason. Hyperlinks and form fields *do* participate — the
+/// existing logic treats them as text-like and we keep that.
 pub(crate) fn is_text_layout_item(item: &crate::types::TextItem) -> bool {
-    !matches!(item.item_type, crate::types::ItemType::Image)
+    !matches!(
+        item.item_type,
+        crate::types::ItemType::Image | crate::types::ItemType::Annotation
+    )
 }
 
 /// Map a (u, v) point in unit-square coordinates through the 6-element CTM
