@@ -1498,6 +1498,36 @@ fn test_freetext_annotation_renders_as_distinct_block() {
     );
 }
 
+/// This fixture is a real hybrid-reference PDF (nanospainconf.org, from the
+/// finepdfs-english corpus) whose `/XRefStm` cross-reference stream has a
+/// stray byte between its EOL terminator and `endstream` (a producer bug
+/// present in every stream in the file). lopdf's stream parser requires
+/// `endstream` immediately after an optional EOL, so that stray byte broke
+/// the `/XRefStm` parse — fatal to the whole document, since reader.rs's
+/// hybrid-reference xref chase discards the already-merged classic `/Prev`
+/// table when the `/XRefStm` re-parse fails, rather than falling back to
+/// it. Before `fix_stray_byte_before_endstream`, this document failed to
+/// load at all ("invalid cross reference table"); real body text is
+/// recoverable once the container repair lets lopdf's own `/Prev` table
+/// take over.
+#[test]
+fn test_stray_byte_before_endstream_recovers_hybrid_xref_document() {
+    let buf = std::fs::read("tests/fixtures/stray_byte_before_endstream.pdf").unwrap();
+    let result = process_pdf_mem(&buf).unwrap();
+    let md = result.markdown.unwrap();
+
+    assert_eq!(result.page_count, 2);
+    assert!(
+        md.contains("SULFUR HEXAFLUORIDE ADSORPTION PREDICTION"),
+        "Should recover real body text, not just fail to load: {md}"
+    );
+    assert!(
+        md.len() > 2000,
+        "Recovered content should be substantial, not a truncated fragment: {} chars",
+        md.len()
+    );
+}
+
 #[test]
 fn test_tagged_pdf_text_items_carry_mcid() {
     let buf = std::fs::read("tests/fixtures/firecrawl_docs_tagged.pdf").unwrap();

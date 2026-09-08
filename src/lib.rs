@@ -3879,6 +3879,7 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
     let mut candidates = Vec::new();
 
     add_repair_candidate(&mut candidates, append_missing_eof_marker(buf), buf);
+    add_repair_candidate(&mut candidates, fix_stray_byte_before_endstream(buf), buf);
     for candidate in recover_startxref_pointer_candidates(buf) {
         add_repair_candidate(&mut candidates, Some(candidate), buf);
     }
@@ -3889,6 +3890,11 @@ fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
         add_repair_candidate(
             &mut candidates,
             append_missing_eof_marker(stripped_buf),
+            buf,
+        );
+        add_repair_candidate(
+            &mut candidates,
+            fix_stray_byte_before_endstream(stripped_buf),
             buf,
         );
         for candidate in recover_startxref_pointer_candidates(stripped_buf) {
@@ -4081,6 +4087,76 @@ fn strip_leading_pdf_container_bytes(buf: &[u8]) -> Option<Vec<u8>> {
     } else {
         None
     }
+}
+
+/// Some PDF writers emit a single stray byte between a stream's EOL
+/// terminator and the `endstream` keyword — e.g. `<data>\r endstream`
+/// (a stray space between the `\r` and `endstream` that shouldn't be
+/// there at all; the well-formed form is `<data>\rendstream`). lopdf's
+/// stream parser requires `endstream` immediately after an *optional* EOL
+/// (`opt(eol)` then `tag("endstream")`; `eol` itself matches `\r\n`, `\n`,
+/// or `\r` — see lopdf's `parser::mod::eol`), so that stray byte breaks the
+/// match outright and the whole containing object fails to parse. When the
+/// broken stream is a hybrid-reference PDF's `/XRefStm` cross-reference
+/// stream, this is fatal to the *entire document*: reader.rs's `/Prev`
+/// chase merges the classic xref table first, then re-parses the stream
+/// pointed to by `/XRefStm` with a bare `?` — discarding the
+/// already-merged classic table instead of falling back to it when that
+/// inner parse fails.
+///
+/// Fixed by turning the stray byte into the second half of a CRLF: when
+/// the byte immediately before it is `\r`, overwriting the stray byte with
+/// `\n` makes lopdf's `eol` parser consume the resulting `\r\n` as one
+/// unit, and `endstream` matches directly after — a same-length, in-place
+/// substitution.
+///
+/// Deliberately a substitution, not a deletion, despite deletion being the
+/// more obvious "strip the junk byte" fix: deleting a byte shifts every
+/// absolute file offset recorded after it (classic xref table entries,
+/// `/Prev`/`/XRefStm`/`startxref` pointers, and any xref stream's own
+/// encoded offsets). Confirmed empirically against the corpus's failing
+/// instance (nanospainconf.org_5c9fcdf9-485.pdf, finepdfs-english corpus):
+/// deletion "fixes" the immediate parse error but corrupts dozens of
+/// *other*, unrelated objects' offsets, producing a cascade of
+/// `Object load error at offset N` failures instead of a clean recovery.
+/// Substitution has no such side effect — the file's length and every
+/// other byte's position are untouched.
+///
+/// Only the `\r`-preceded case is fixed. A stray byte preceded by `\n` has
+/// no same-length fix (`eol`'s alternatives unify `\r`+`\n` into one CRLF
+/// match, but never unify `\n`+`\n`), and is left untouched rather than
+/// risk an offset-shifting deletion for it.
+fn fix_stray_byte_before_endstream(buf: &[u8]) -> Option<Vec<u8>> {
+    const KEYWORD: &[u8] = b"endstream";
+    let mut fix_positions = Vec::new();
+    let mut search_from = 0usize;
+    while search_from + KEYWORD.len() <= buf.len() {
+        let Some(rel) = buf[search_from..]
+            .windows(KEYWORD.len())
+            .position(|w| w == KEYWORD)
+        else {
+            break;
+        };
+        let pos = search_from + rel;
+        if pos >= 2 {
+            let stray = buf[pos - 1];
+            let before_stray = buf[pos - 2];
+            if before_stray == b'\r' && stray != b'\r' && stray != b'\n' {
+                fix_positions.push(pos - 1);
+            }
+        }
+        search_from = pos + KEYWORD.len();
+    }
+
+    if fix_positions.is_empty() {
+        return None;
+    }
+
+    let mut repaired = buf.to_vec();
+    for pos in fix_positions {
+        repaired[pos] = b'\n';
+    }
+    Some(repaired)
 }
 
 /// Core processing pipeline operating on a pre-loaded document.
@@ -8043,5 +8119,50 @@ mod tests {
             candidates[1].ends_with(b"startxref\n0\n%%EOF\n"),
             "second candidate should fall back to the earlier, complete table"
         );
+    }
+
+    #[test]
+    fn fix_stray_byte_before_endstream_fixes_cr_preceded_stray_byte() {
+        // The confirmed real-world shape: stream data, a CR, a stray extra
+        // byte (here a space), then "endstream" with no EOL of its own —
+        // the stray byte is what breaks lopdf's `opt(eol)` + `tag("endstream")`
+        // parse.
+        let buf = b"stream\r\nAAAA\r endstream\r\nendobj";
+        let fixed = fix_stray_byte_before_endstream(buf).expect("should detect and fix");
+        assert_eq!(fixed.len(), buf.len(), "must be a same-length substitution");
+        assert_eq!(&fixed, b"stream\r\nAAAA\r\nendstream\r\nendobj");
+    }
+
+    #[test]
+    fn fix_stray_byte_before_endstream_fixes_multiple_occurrences_in_one_buffer() {
+        let buf = b"stream\r\nAA\r?endstream\r\nstream\r\nBB\r!endstream\r\n";
+        let fixed = fix_stray_byte_before_endstream(buf).expect("should fix both occurrences");
+        assert_eq!(fixed.len(), buf.len());
+        assert_eq!(
+            &fixed,
+            b"stream\r\nAA\r\nendstream\r\nstream\r\nBB\r\nendstream\r\n"
+        );
+    }
+
+    #[test]
+    fn fix_stray_byte_before_endstream_leaves_well_formed_streams_alone() {
+        // No stray byte in either the CRLF or bare-CR EOL form — nothing to
+        // fix.
+        assert!(
+            fix_stray_byte_before_endstream(b"stream\r\nAAAA\r\nendstream\r\nendobj").is_none()
+        );
+        assert!(fix_stray_byte_before_endstream(b"stream\r\nAAAA\rendstream\r\nendobj").is_none());
+        // No "endstream" at all.
+        assert!(fix_stray_byte_before_endstream(b"just some ordinary PDF bytes").is_none());
+    }
+
+    #[test]
+    fn fix_stray_byte_before_endstream_skips_lf_preceded_stray_byte() {
+        // A stray byte after a lone LF (not CR) has no same-length fix —
+        // lopdf's `eol` alternatives never unify `\n`+`\n` into one match
+        // the way they do `\r`+`\n`. Left untouched rather than risk an
+        // offset-shifting deletion.
+        let buf = b"stream\nAAAA\n endstream\nendobj";
+        assert!(fix_stray_byte_before_endstream(buf).is_none());
     }
 }
