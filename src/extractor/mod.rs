@@ -668,7 +668,19 @@ pub(crate) fn pen_track_glyphs(
         g.pen = Some(pen);
         last_real_pen = Some(pen);
         let advance = fonts::glyph_advance_ts(g, char_spacing, word_spacing);
-        g.full_advance_ts = advance;
+        // full_advance_ts must be in PAGE-SPACE (matching `.pen`'s own
+        // units — see bidi.rs's doc comment on this field), not the bare
+        // text-space `advance` itself: `advance` is only page-space-sized
+        // when the Tf operand's nominal size matches the text matrix's own
+        // scale, which real PDFs routinely violate (e.g. `/F1 1 Tf` with
+        // the actual size folded into `Tm` instead) — this caused
+        // `full_advance_ts` to be under/over-scaled by that same ratio,
+        // corrupting bidi.rs's pen-geometry hypothesis test. `combined[0]`
+        // is this glyph's own combined-matrix x-scale (text matrix * ctm,
+        // already computed above for `pen`), so `advance * combined[0]`
+        // is exactly the page-space x-delta the next glyph's `pen` will
+        // show — consistent with this module's ndir=(1,0) simplification.
+        g.full_advance_ts = advance * combined[0];
         glyph_tm[4] += advance * glyph_tm[0];
         glyph_tm[5] += advance * glyph_tm[1];
     }
