@@ -1277,6 +1277,12 @@ pub(crate) struct GlyphDecode {
     /// as any other unpositioned glyph's implicit default. Phase 3's own
     /// consumer (`bidi::apply_bidi_reversal`) is the reason this exists.
     pub(crate) full_advance_ts: f32,
+    /// `true` only for a space glyph pushed by an extraction heuristic
+    /// (TJ kerning-gap space, merge-gap space), never decoded from a real
+    /// code. Such a glyph shares a filler's `code_count == 0` shape but is
+    /// NOT part of any ligature, so `bidi::group_into_units` must not glue
+    /// it to the preceding real glyph.
+    pub(crate) is_synthetic_space: bool,
 }
 
 /// A glyph's own text-space advance, INCLUDING its share of Tc (char
@@ -1319,6 +1325,7 @@ fn glyphs_from_aligned_units(
                     space_count: is_space as u16,
                     pen: None,
                     full_advance_ts: 0.0,
+                    is_synthetic_space: false,
                 });
                 for extra in chars {
                     // Filler glyph: no code, no code_count/space_count — it
@@ -1332,6 +1339,7 @@ fn glyphs_from_aligned_units(
                         space_count: 0,
                         pen: None,
                         full_advance_ts: 0.0,
+                        is_synthetic_space: false,
                     });
                 }
             }
@@ -1343,6 +1351,7 @@ fn glyphs_from_aligned_units(
                 space_count: is_space as u16,
                 pen: None,
                 full_advance_ts: 0.0,
+                is_synthetic_space: false,
             }),
         }
     }
@@ -1370,6 +1379,7 @@ fn opaque_glyph(
         space_count: space_count as u16,
         pen: None,
         full_advance_ts: 0.0,
+        is_synthetic_space: false,
     }]
 }
 

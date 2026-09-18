@@ -711,6 +711,7 @@ pub(crate) fn push_synthetic_space_glyph(
         space_count: 0,
         pen: Some((combined[4], combined[5])),
         full_advance_ts: 0.0,
+        is_synthetic_space: true,
     });
 }
 
@@ -1401,6 +1402,7 @@ pub(crate) fn merge_text_items_with_glyphs(
                         space_count: 0,
                         pen: None,
                         full_advance_ts: 0.0,
+                        is_synthetic_space: true,
                     });
                 }
                 text.push_str(&next.text);

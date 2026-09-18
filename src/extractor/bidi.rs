@@ -186,11 +186,21 @@ struct Unit {
     indices: Vec<usize>,
 }
 
+/// A ligature filler: `code_count == 0` and not a synthetic space. A
+/// synthetic space (TJ kerning-gap space) shares the `code_count == 0`
+/// shape but belongs to no ligature — gluing it to the preceding real glyph
+/// made it travel with that glyph through reversal. In visual-order RTL
+/// text that glyph is the word's first logical letter, so a justified line
+/// like `<0003 ...word...> -105 <0003 ...>` came out as "ا لبديلة".
+fn is_filler(g: &GlyphDecode) -> bool {
+    g.code_count == 0 && !g.is_synthetic_space
+}
+
 fn group_into_units(glyphs: &[GlyphDecode]) -> Vec<Unit> {
     let mut units = Vec::new();
     let mut i = 0;
     while i < glyphs.len() {
-        if glyphs[i].code_count == 0 {
+        if is_filler(&glyphs[i]) {
             // A filler with no preceding real glyph in this slice shouldn't
             // happen for decode_operand_glyphs output (fillers only ever
             // follow their own real glyph in the same call) — but stay
@@ -201,7 +211,7 @@ fn group_into_units(glyphs: &[GlyphDecode]) -> Vec<Unit> {
         }
         let mut indices = vec![i];
         let mut j = i + 1;
-        while j < glyphs.len() && glyphs[j].code_count == 0 {
+        while j < glyphs.len() && is_filler(&glyphs[j]) {
             indices.push(j);
             j += 1;
         }
@@ -518,6 +528,7 @@ mod tests {
             space_count: 0,
             pen: Some((pen_x, pen_y)),
             full_advance_ts: advance,
+            is_synthetic_space: false,
         }
     }
 
@@ -626,6 +637,7 @@ mod tests {
                 space_count: 0,
                 pen: Some((110.0, 700.0)),
                 full_advance_ts: 10.0,
+                is_synthetic_space: false,
             },
             GlyphDecode {
                 text: "ا".to_string(), // filler: the ligature's 2nd character
@@ -635,6 +647,7 @@ mod tests {
                 space_count: 0,
                 pen: Some((120.0, 700.0)), // shares its real glyph's post-advance position, per Phase 2
                 full_advance_ts: 0.0,
+                is_synthetic_space: false,
             },
         ];
 
@@ -648,6 +661,60 @@ mod tests {
         assert_eq!(glyphs[0].text, "ل");
         assert_eq!(glyphs[1].text, "ا");
         assert_eq!(glyphs[2].text, "ت");
+    }
+
+    fn synthetic_space(pen_x: f32, pen_y: f32) -> GlyphDecode {
+        GlyphDecode {
+            text: " ".to_string(),
+            width_ts: 0.0,
+            cid: None,
+            code_count: 0,
+            space_count: 0,
+            pen: Some((pen_x, pen_y)),
+            full_advance_ts: 0.0,
+            is_synthetic_space: true,
+        }
+    }
+
+    #[test]
+    fn synthetic_space_does_not_travel_with_first_logical_letter() {
+        // Aspose/Word justified-line shape: each word is its own chunk
+        // opening with a real space glyph, in visual order, and the
+        // justification kern (e.g. `-105`) between chunks gets a TJ
+        // synthetic space at the end of the preceding word — right after
+        // that word's rightmost glyph, i.e. its FIRST logical letter.
+        // Logical text "في من": visual L→R stream is " نم" + synth + " يف".
+        // Before the fix the synthetic space was grouped as a ligature
+        // filler of "م" and the reversal emitted "في م ن".
+        // Geometry mirrors the traced page: letters ~0.5em, space glyph
+        // ~0.25em, justification kern ~0.105em (`-105`).
+        let font_size = 10.0;
+        let mut glyphs = vec![
+            glyph(" ", 100.0, 700.0, 2.5),
+            glyph("ن", 102.5, 700.0, 5.0),
+            glyph("م", 107.5, 700.0, 5.0),
+            synthetic_space(112.5, 700.0),
+            glyph(" ", 113.55, 700.0, 2.5),
+            glyph("ي", 116.05, 700.0, 5.0),
+            glyph("ف", 121.05, 700.0, 5.0),
+        ];
+
+        let mut carry = PenContinuity::default();
+        assert!(apply_bidi_reversal(&mut glyphs, font_size, &mut carry));
+
+        let text: String = glyphs.iter().map(|g| g.text.as_str()).collect();
+        let words: Vec<&str> = text.split_whitespace().collect();
+        assert_eq!(words, ["في", "من"], "got {text:?}");
+    }
+
+    #[test]
+    fn only_non_synthetic_code_count_zero_glyphs_are_fillers() {
+        let mut filler = glyph(" ", 100.0, 700.0, 0.0);
+        filler.cid = None;
+        filler.code_count = 0;
+        assert!(is_filler(&filler));
+        assert!(!is_filler(&synthetic_space(100.0, 700.0)));
+        assert!(!is_filler(&glyph("ب", 100.0, 700.0, 10.0)));
     }
 
     #[test]
