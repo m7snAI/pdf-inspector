@@ -14,9 +14,9 @@ use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
 use super::fonts::{
-    build_font_encodings, build_font_widths, build_type3_scales, compute_string_width_ts,
-    decode_operand_glyphs, descriptor_style_flags, get_font_file2_obj_num, get_operand_bytes,
-    CMapDecisionCache, FontStyleCache, GlyphDecode,
+    build_font_encodings, build_font_widths, build_type3_scales, bytes_are_all_spaces,
+    compute_string_width_ts, decode_operand_glyphs, descriptor_style_flags, get_font_file2_obj_num,
+    get_operand_bytes, CMapDecisionCache, FontStyleCache, GlyphDecode,
 };
 use super::underline::UnderlineLine;
 use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
@@ -330,6 +330,15 @@ pub(crate) fn extract_page_text_items(
                                                            // the rise of its GLYPHS, not whatever rise is set by EMC time.
     let mut actual_text_start_rise: f32 = 0.0;
     let mut actual_text_glyph_rise: Option<f32> = None;
+    // Whether every real (suppressed) glyph shown so far inside the current
+    // ActualText span was the font's space code — independent of what the
+    // ActualText override value itself says. A bidi mark (U+200F/U+200E/
+    // U+061C) or other non-whitespace override riding on a real space glyph
+    // must still contribute a literal space to the merged text, or two real
+    // neighboring words silently fuse once the EMC width fix removes the
+    // accidental spacer their old, incorrectly-inflated width used to
+    // provide. `None` until the first real glyph is seen inside the span.
+    let mut actual_text_all_spaces: Option<bool> = None;
     /// Get the innermost MCID from the marked content stack.
     fn current_mcid(stack: &[MarkedContentEntry]) -> Option<i64> {
         stack.iter().rev().find_map(|e| e.mcid)
@@ -550,6 +559,13 @@ pub(crate) fn extract_page_text_items(
                         if actual_text_glyph_tm.is_none() {
                             actual_text_glyph_tm = Some(text_matrix);
                             actual_text_glyph_rise = Some(text_rise);
+                        }
+                        if let Some(fi) = font_widths.get(&current_font) {
+                            if let Some(raw) = get_operand_bytes(&reversed_operand) {
+                                let all_spaces = bytes_are_all_spaces(raw, fi);
+                                actual_text_all_spaces =
+                                    Some(actual_text_all_spaces.unwrap_or(true) && all_spaces);
+                            }
                         }
                         if let Some(w_ts) = w_ts_opt {
                             text_matrix[4] += w_ts * text_matrix[0];
@@ -810,6 +826,12 @@ pub(crate) fn extract_page_text_items(
                                         char_spacing,
                                         word_spacing,
                                     );
+                                    if suppress_glyph_extraction {
+                                        let all_spaces = bytes_are_all_spaces(raw_bytes, fi);
+                                        actual_text_all_spaces = Some(
+                                            actual_text_all_spaces.unwrap_or(true) && all_spaces,
+                                        );
+                                    }
                                 }
                             }
                             if !is_invisible {
@@ -969,6 +991,15 @@ pub(crate) fn extract_page_text_items(
                         .is_some_and(|raw| !raw.is_empty())
                 {
                     skipped_invisible = true;
+                }
+                if suppress_glyph_extraction {
+                    if let Some(fi) = font_widths.get(&current_font) {
+                        if let Some(raw) = op.operands.first().and_then(get_operand_bytes) {
+                            let all_spaces = bytes_are_all_spaces(raw, fi);
+                            actual_text_all_spaces =
+                                Some(actual_text_all_spaces.unwrap_or(true) && all_spaces);
+                        }
+                    }
                 }
                 if !((text_rendering_mode == 3 && !include_invisible)
                     || suppress_glyph_extraction
@@ -1162,6 +1193,7 @@ pub(crate) fn extract_page_text_items(
                     actual_text_start_rise = text_rise;
                     actual_text_glyph_tm = None; // reset — will be captured at first Tj/TJ
                     actual_text_glyph_rise = None;
+                    actual_text_all_spaces = None;
                 }
                 marked_content_stack.push(MarkedContentEntry {
                     actual_text,
@@ -1180,6 +1212,10 @@ pub(crate) fn extract_page_text_items(
                         let glyph_tm = actual_text_glyph_tm.take();
                         let glyph_rise = actual_text_glyph_rise.take();
                         let entry_tm = actual_text_start_tm.take();
+                        // Real, suppressed glyphs were a literal space — the
+                        // ActualText override (e.g. a bidi mark) must not
+                        // erase that visible separator from the merged text.
+                        let all_spaces = actual_text_all_spaces.take().unwrap_or(false);
                         if let Some(start_tm) = glyph_tm.or(entry_tm) {
                             let rise = glyph_rise.unwrap_or(actual_text_start_rise);
                             let combined = multiply_matrices(&rise_adjusted(&start_tm, rise), &ctm);
@@ -1193,9 +1229,24 @@ pub(crate) fn extract_page_text_items(
                             let (x, y) = (combined[4], combined[5]);
                             // Width in device space from text matrix delta
                             let delta_ts = text_matrix[4] - start_tm[4];
-                            let scale_x = start_tm[0] * ctm[0] + start_tm[1] * ctm[2];
-                            let width = (delta_ts * scale_x).abs();
-                            if !at.trim().is_empty() {
+                            let delta_ts_y = text_matrix[5] - start_tm[5];
+                            let width = (delta_ts * ctm[0] + delta_ts_y * ctm[2]).abs();
+                            // A literal space among the real, suppressed
+                            // glyphs wins over whatever the ActualText value
+                            // says: it's a real visual separator between two
+                            // neighbors, and correctly-computed width alone
+                            // (see the width fix above) isn't enough to
+                            // signal that to the merge logic once the
+                            // override's own text is non-whitespace (a bidi
+                            // mark) or otherwise not a space itself.
+                            let emit_text = if all_spaces {
+                                Some(" ".to_string())
+                            } else if !at.trim().is_empty() {
+                                Some(expand_ligatures(&at))
+                            } else {
+                                None
+                            };
+                            if let Some(text) = emit_text {
                                 let base_font = font_base_names
                                     .get(&current_font)
                                     .map(|s| s.as_str())
@@ -1210,7 +1261,7 @@ pub(crate) fn extract_page_text_items(
                                 // aligned with items.
                                 item_glyphs.push(Vec::new());
                                 items.push(TextItem {
-                                    text: expand_ligatures(&at),
+                                    text,
                                     x,
                                     y,
                                     width,
@@ -1957,6 +2008,42 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET
 
         assert!((sup.y - 505.0).abs() < 0.1);
         assert!((after.y - 500.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn actual_text_real_space_glyph_wins_over_non_space_override() {
+        // A bidi mark (U+200F/U+200E/U+061C) or other non-whitespace value
+        // riding on a real space glyph is common in Arabic InDesign output
+        // — "X" here stands in for one. The real, suppressed glyph shown
+        // inside the span is a literal space byte; the emitted item's text
+        // must be that space, not the override value, or two real
+        // neighboring words lose their separator once the width fix (this
+        // same change) makes the item's width small and correct instead of
+        // accidentally inflated.
+        let content = b"BT /F1 12 Tf 1 0 0 1 100 500 Tm \
+/Span <</ActualText (X) >> BDC ( ) Tj EMC ET";
+
+        let items = extract_simple_items(content);
+        assert_eq!(items.len(), 1, "exactly one ActualText item expected");
+        assert_eq!(
+            items[0].text, " ",
+            "a real space glyph must win over a non-space ActualText override"
+        );
+    }
+
+    #[test]
+    fn actual_text_non_space_content_correction_still_used() {
+        // The ordinary case (e.g. a font's broken ToUnicode entry patched
+        // per-instance via ActualText, common for Arabic presentation-form
+        // glyphs): the suppressed glyph is real, non-space content, so the
+        // override value is what should be emitted, exactly as before this
+        // change.
+        let content = b"BT /F1 12 Tf 1 0 0 1 100 500 Tm \
+/Span <</ActualText (Y) >> BDC (Z) Tj EMC ET";
+
+        let items = extract_simple_items(content);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "Y");
     }
 
     #[test]

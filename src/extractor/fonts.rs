@@ -662,7 +662,7 @@ pub(crate) struct RawGlyphWidth {
 /// This is `compute_string_width_ts`'s old inline loop, factored out so its
 /// per-code step can be shared with the combined decode/width walk — the
 /// loop over `bytes` now runs once for both concerns rather than twice.
-fn raw_glyph_widths(bytes: &[u8], font_info: &FontWidthInfo) -> Vec<RawGlyphWidth> {
+pub(crate) fn raw_glyph_widths(bytes: &[u8], font_info: &FontWidthInfo) -> Vec<RawGlyphWidth> {
     let mut out = Vec::new();
     if font_info.is_cid {
         // 2-byte (big-endian) character codes
@@ -698,6 +698,17 @@ fn raw_glyph_widths(bytes: &[u8], font_info: &FontWidthInfo) -> Vec<RawGlyphWidt
         }
     }
     out
+}
+
+/// True when `bytes` decodes to at least one glyph and every glyph is the
+/// font's space code (CID 32 for CID fonts, byte 0x20 otherwise). Used to
+/// tell whether a suppressed (`/ActualText`-overridden) run's real, shown
+/// glyphs were a literal space — see the "EMC" arm's use of this in
+/// content_stream.rs for why that matters independently of what the
+/// ActualText override value itself says.
+pub(crate) fn bytes_are_all_spaces(bytes: &[u8], font_info: &FontWidthInfo) -> bool {
+    let widths = raw_glyph_widths(bytes, font_info);
+    !widths.is_empty() && widths.iter().all(|w| w.is_space)
 }
 
 /// Compute the width of a string in text space units,
