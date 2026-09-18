@@ -287,9 +287,49 @@ pub(crate) fn apply_bidi_reversal(
     // both are RTL-classified.
     let mut run_break: Vec<bool> = vec![false; units.len()];
 
-    // Seeded from `carry` (the previous item's own last unit), not a cold
-    // start — see module docs on why this crosses item boundaries.
+    // Seeded from `carry` (the previous item's own last unit) when the
+    // caller supplies one; every current call site passes a fresh
+    // `PenContinuity::default()` though (cold start — see mod.rs's own
+    // comment on why cross-item carry was tried and reverted), so
+    // `carry.cur_bidi` is always 0 in practice today.
     let mut cur_bidi: u8 = carry.cur_bidi;
+    // A cold start's cur_bidi=0 default is a real problem when THIS item
+    // opens with neutral/weak glyphs (a real separator space stored
+    // ahead of the RTL run it separates, which happens whenever a
+    // preceding ActualText span, TJ sub-item split, or column break lands
+    // right after it): `guess_bidi_level`'s neutral/weak classes all
+    // inherit `cur_bidi`, and with nothing real to inherit yet they
+    // default to LTR — excluding them from the very run they open, so
+    // reversing that run leaves them stranded on the wrong side of the
+    // word they're supposed to separate (confirmed: a leading space runs
+    // together with the following RTL word instead of trailing it,
+    // fusing it with whatever item comes next). Standard bidi resolution
+    // gives leading neutrals the direction of the next STRONG character
+    // instead of an arbitrary default — do that lookahead once, scoped
+    // to this item's own units only. This is NOT cross-item carry (it
+    // never looks outside `units`), so it doesn't reopen the "corrupted
+    // word separators between independently-reversed items" failure mode
+    // documented in mod.rs — that one came from threading PEN geometry
+    // across item boundaries, not from how a single item's own leading
+    // neutrals resolve.
+    if carry.lag_pen.is_none() {
+        if let Some(seed) = units.iter().find_map(|u| {
+            let class = glyphs[u.indices[0]].text.chars().next().map(bidi_class)?;
+            let strong = matches!(
+                class,
+                BidiClass::L
+                    | BidiClass::R
+                    | BidiClass::AL
+                    | BidiClass::EN
+                    | BidiClass::ES
+                    | BidiClass::ET
+                    | BidiClass::AN
+            );
+            strong.then(|| guess_bidi_level(class, 0))
+        }) {
+            cur_bidi = seed;
+        }
+    }
     let mut lag_pen: Option<(f32, f32)> = carry.lag_pen; // dev->lag_pen
     let mut pen_end: Option<(f32, f32)> = carry.pen_end; // dev->pen
     let mut last_bidi: u8 = carry.last_bidi;
@@ -531,6 +571,41 @@ mod tests {
         );
         let text: String = glyphs.iter().map(|g| g.text.as_str()).collect();
         assert_eq!(text, "بيت", "already-correct text must be untouched");
+    }
+
+    #[test]
+    fn leading_separator_space_moves_to_the_far_end_on_reversal() {
+        // A real separator space (decoded from an actual space CID, not
+        // synthetic) stored AHEAD of a visual-order RTL run in the same
+        // item — exactly what happens when a preceding ActualText span,
+        // TJ sub-item split, or column break lands right after it. Pen
+        // position 90 is BEFORE the run's own 100/110/120, consistent
+        // with "visual order": the space is the run's leftmost glyph, so
+        // reading right-to-left (correctly) it comes LAST, not first.
+        // Before this fix, guess_bidi_level's cold per-item cur_bidi=0
+        // default resolved this leading whitespace unit as LTR (nothing
+        // to inherit yet), excluding it from the RTL run and leaving it
+        // stranded at the front after the run reversed — silently fusing
+        // this item with whatever the next item's text started with.
+        let font_size = 10.0;
+        let mut glyphs = vec![
+            glyph(" ", 90.0, 700.0, 10.0),
+            glyph("ت", 100.0, 700.0, 10.0),
+            glyph("ي", 110.0, 700.0, 10.0),
+            glyph("ب", 120.0, 700.0, 10.0),
+        ];
+
+        let mut carry = PenContinuity::default();
+        let reversed = apply_bidi_reversal(&mut glyphs, font_size, &mut carry);
+
+        assert!(reversed, "the RTL run must still be flagged and reversed");
+        let text: String = glyphs.iter().map(|g| g.text.as_str()).collect();
+        assert_eq!(
+            text, "بيت ",
+            "the leading space must travel with the run it opens, landing \
+             at the end (trailing) once the run reverses to correct order — \
+             not stay stranded at the front"
+        );
     }
 
     #[test]
